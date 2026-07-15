@@ -32,11 +32,9 @@ OPENAI_ENABLE_WEB_SEARCH=true
 OPENAI_API_KEY=你的New API令牌
 OPENAI_BASE_URL=https://你的-new-api-域名/v1
 OPENAI_MODEL=中转站中实际存在的模型ID
-OPENAI_API_MODE=chat_completions
-OPENAI_ENABLE_WEB_SEARCH=false
 ```
 
-如果你的 New API 已完整支持 `/v1/responses`、Structured Outputs 和 `web_search` 工具，可以把 `OPENAI_API_MODE` 改为 `responses`，并按上游能力决定是否开启网络搜索。
+程序会自动识别非官方 Base URL，并使用 `/chat/completions` 和 `json_object`，因此普通 New API 只需上面三项。如果中转完整支持 `/v1/responses`、Structured Outputs 和 `web_search`，可以显式设置 `OPENAI_API_MODE=responses`、`OPENAI_STRUCTURED_OUTPUT=json_schema` 和 `OPENAI_ENABLE_WEB_SEARCH=true`。
 
 ## 部署
 
@@ -57,8 +55,6 @@ OPENAI_ENABLE_WEB_SEARCH=false
 OPENAI_API_KEY=你的服务端密钥
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_BASE_URL=https://你的-new-api-域名/v1
-OPENAI_API_MODE=chat_completions
-OPENAI_ENABLE_WEB_SEARCH=false
 NODE_ENV=production
 ```
 

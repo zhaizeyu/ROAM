@@ -158,17 +158,35 @@ export async function POST(request: Request) {
     if (!process.env.OPENAI_API_KEY) return NextResponse.json({ plan: demoPlan(input), demo: true });
 
     const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
-    const apiMode = process.env.OPENAI_API_MODE === "chat_completions" ? "chat_completions" : "responses";
-    const webSearchEnabled = apiMode === "responses" && process.env.OPENAI_ENABLE_WEB_SEARCH !== "false";
+    const isOfficialOpenAI = baseUrl === "https://api.openai.com/v1";
+    const configuredApiMode = process.env.OPENAI_API_MODE;
+    const apiMode = configuredApiMode === "responses" || configuredApiMode === "chat_completions"
+      ? configuredApiMode
+      : isOfficialOpenAI ? "responses" : "chat_completions";
+    const configuredWebSearch = process.env.OPENAI_ENABLE_WEB_SEARCH;
+    const webSearchEnabled = apiMode === "responses"
+      && (configuredWebSearch ? configuredWebSearch === "true" : isOfficialOpenAI);
+    const configuredOutputMode = process.env.OPENAI_STRUCTURED_OUTPUT;
+    const structuredOutput = configuredOutputMode === "json_schema" || configuredOutputMode === "json_object"
+      ? configuredOutputMode
+      : apiMode === "chat_completions" && !isOfficialOpenAI ? "json_object" : "json_schema";
     const verificationRule = webSearchEnabled
       ? "使用网络搜索核对景点营业时间、交通施工和官方购票网站。"
       : "当前没有网络搜索工具，不得声称已经实时核验；所有开放时间和票务信息都要提示用户临行前复核。";
-    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. 工作日严格尊重可用时段，适度安排并保留休息。2. ${verificationRule} 3. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。4. 只有确认是官方来源时才给 ticket 链接，否则给 Google Maps 搜索链接并在文字中提示复核。5. 不承诺实时交通，notice 用一句话提示临出发前复核。6. 输出简体中文，日期覆盖用户范围，最多10天。`;
+    const jsonInstruction = structuredOutput === "json_object"
+      ? `\n7. 只输出合法 JSON，不要输出 Markdown 或解释。JSON 必须严格符合这个结构：${JSON.stringify(schema)}`
+      : "";
+    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. 工作日严格尊重可用时段，适度安排并保留休息。2. ${verificationRule} 3. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。4. 只有确认是官方来源时才给 ticket 链接，否则给 Google Maps 搜索链接并在文字中提示复核。5. 不承诺实时交通，notice 用一句话提示临出发前复核。6. 输出简体中文，日期覆盖用户范围，最多10天。${jsonInstruction}`;
     const responseBody = apiMode === "chat_completions"
       ? {
           model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_schema", json_schema: { name: "travel_plan", strict: true, schema } },
+          messages: [
+            { role: "system", content: "You are a travel planner. Always return valid JSON only." },
+            { role: "user", content: prompt },
+          ],
+          response_format: structuredOutput === "json_object"
+            ? { type: "json_object" }
+            : { type: "json_schema", json_schema: { name: "travel_plan", strict: true, schema } },
         }
       : {
           model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
