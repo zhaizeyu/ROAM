@@ -49,8 +49,8 @@ OPENAI_ENABLE_WEB_SEARCH=false
 1. 把项目推送到 GitHub、GitLab 或 Coolify 可访问的 Git 仓库。
 2. 在 Coolify 中选择 **New Resource → Application**，连接仓库。
 3. Build Pack 选择 **Dockerfile**，Dockerfile Location 使用 `/Dockerfile`。
-4. Base Directory 使用 `/`，Ports Exposes 填写 `3000`。
-5. 配置域名，例如 `https://trip.example.com`，让 Coolify 自动申请 HTTPS 证书。
+4. Base Directory 使用 `/`，容器端口（Ports Exposes）填写 `3000`。
+5. 配置域名，例如 `https://trip.example.com`。Coolify 的反向代理会把域名流量直接转发到容器内部 `3000` 端口，并自动申请 HTTPS 证书；不要配置宿主机端口映射。
 6. 在 Environment Variables 中添加：
 
 ```env
@@ -62,7 +62,7 @@ OPENAI_ENABLE_WEB_SEARCH=false
 NODE_ENV=production
 ```
 
-`OPENAI_API_KEY` 只需勾选 **Runtime Variable**，关闭 **Build Variable**，避免密钥进入镜像构建信息。`PORT` 和 `HOST` 通常由 Coolify 自动提供；镜像默认监听 `0.0.0.0:3000`。
+`OPENAI_API_KEY` 只需勾选 **Runtime Variable**，关闭 **Build Variable**，避免密钥进入镜像构建信息。无需在 Coolify 环境变量中配置 `PORT` 或 `HOSTNAME`，也无需把容器端口映射到宿主机。
 
 健康检查已经写入 Dockerfile：
 
