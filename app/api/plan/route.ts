@@ -14,6 +14,40 @@ type PlannerInput = {
   constraints: string;
 };
 
+type AIBackend = "openai" | "hermes";
+
+function getAIConfig() {
+  const backend: AIBackend = process.env.AI_BACKEND === "hermes"
+    ? "hermes"
+    : process.env.AI_BACKEND === "openai" ? "openai" : process.env.HERMES_BASE_URL ? "hermes" : "openai";
+  const baseUrl = (backend === "hermes"
+    ? process.env.HERMES_BASE_URL || "http://hermes:8642/v1"
+    : process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+  return {
+    backend,
+    baseUrl,
+    apiKey: backend === "hermes" ? process.env.HERMES_API_KEY : process.env.OPENAI_API_KEY,
+    model: backend === "hermes" ? process.env.HERMES_MODEL || "roam-agent" : process.env.OPENAI_MODEL || "gpt-5.4-mini",
+  };
+}
+
+function normalizeInput(input: Partial<PlannerInput> | null | undefined): PlannerInput {
+  const text = (value: unknown, max: number) => typeof value === "string" ? value.trim().slice(0, max) : "";
+  return {
+    destination: text(input?.destination, 100),
+    base: text(input?.base, 200),
+    startDate: text(input?.startDate, 10),
+    endDate: text(input?.endDate, 10),
+    tripMode: input?.tripMode === "leisure" ? "leisure" : "work",
+    weekdayWindow: text(input?.weekdayWindow, 200),
+    weekendWindow: text(input?.weekendWindow, 200),
+    pace: text(input?.pace, 20),
+    interests: Array.isArray(input?.interests) ? input.interests.slice(0, 12).map((item) => text(item, 40)).filter(Boolean) : [],
+    mustDo: text(input?.mustDo, 1000),
+    constraints: text(input?.constraints, 1000),
+  };
+}
+
 const googleRoute = (origin: string, destination: string, mode = "transit", waypoints = "") =>
   `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&travelmode=${mode}${waypoints ? `&waypoints=${encodeURIComponent(waypoints)}` : ""}`;
 
@@ -147,20 +181,40 @@ function extractChatText(response: { choices?: Array<{ message?: { content?: str
 
 function parseModelJson(text: string) {
   const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  return JSON.parse(cleaned);
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start < 0 || end <= start) throw new Error("智能体没有返回合法的行程 JSON。");
+    return JSON.parse(cleaned.slice(start, end + 1));
+  }
+}
+
+function validatePlan(plan: unknown) {
+  if (!plan || typeof plan !== "object") throw new Error("智能体返回的行程格式无效。");
+  const candidate = plan as { destination?: unknown; days?: Array<{ stops?: unknown[] }> };
+  if (typeof candidate.destination !== "string" || !Array.isArray(candidate.days) || candidate.days.length < 1 || candidate.days.length > 10) {
+    throw new Error("智能体返回的行程缺少必要字段。");
+  }
+  if (candidate.days.some((day) => !Array.isArray(day.stops) || day.stops.length < 2 || day.stops.length > 9)) {
+    throw new Error("智能体返回的每日行程格式无效。");
+  }
+  return plan;
 }
 
 export async function POST(request: Request) {
   try {
-    const input = (await request.json()) as PlannerInput;
+    const input = normalizeInput((await request.json()) as PlannerInput);
     if (!input.destination?.trim() || !input.startDate || !input.endDate) return NextResponse.json({ error: "请填写目的地和出行日期。" }, { status: 400 });
     if (datesBetween(input.startDate, input.endDate).length === 0) return NextResponse.json({ error: "结束日期不能早于开始日期，单次最多规划10天。" }, { status: 400 });
-    if (!process.env.OPENAI_API_KEY) return NextResponse.json({ plan: demoPlan(input), demo: true });
+    const ai = getAIConfig();
+    if (!ai.apiKey) return NextResponse.json({ plan: demoPlan(input), demo: true });
 
-    const baseUrl = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/+$/, "");
+    const baseUrl = ai.baseUrl;
     const isOfficialOpenAI = baseUrl === "https://api.openai.com/v1";
     const configuredApiMode = process.env.OPENAI_API_MODE;
-    const apiMode = configuredApiMode === "responses" || configuredApiMode === "chat_completions"
+    const apiMode = ai.backend === "hermes" ? "chat_completions" : configuredApiMode === "responses" || configuredApiMode === "chat_completions"
       ? configuredApiMode
       : isOfficialOpenAI ? "responses" : "chat_completions";
     const configuredWebSearch = process.env.OPENAI_ENABLE_WEB_SEARCH;
@@ -170,42 +224,57 @@ export async function POST(request: Request) {
     const structuredOutput = configuredOutputMode === "json_schema" || configuredOutputMode === "json_object"
       ? configuredOutputMode
       : apiMode === "chat_completions" && !isOfficialOpenAI ? "json_object" : "json_schema";
-    const verificationRule = webSearchEnabled
+    const verificationRule = ai.backend === "hermes"
+      ? "必须主动调用 web_search 核对动态信息，优先使用景点、交通机构、赛事组织方和票务方的官方来源；如果工具不可用或无法核实，必须明确写入 notice，不得假装已经核验。"
+      : webSearchEnabled
       ? "使用网络搜索核对景点营业时间、交通施工和官方购票网站。"
       : "当前没有网络搜索工具，不得声称已经实时核验；所有开放时间和票务信息都要提示用户临行前复核。";
     const jsonInstruction = structuredOutput === "json_object"
       ? `\n7. 只输出合法 JSON，不要输出 Markdown 或解释。JSON 必须严格符合这个结构：${JSON.stringify(schema)}`
       : "";
-    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. 工作日严格尊重可用时段，适度安排并保留休息。2. ${verificationRule} 3. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。4. 只有确认是官方来源时才给 ticket 链接，否则给 Google Maps 搜索链接并在文字中提示复核。5. 不承诺实时交通，notice 用一句话提示临出发前复核。6. 输出简体中文，日期覆盖用户范围，最多10天。${jsonInstruction}`;
+    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. 工作日严格尊重可用时段，适度安排并保留休息。2. ${verificationRule} 3. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。4. 只有确认是官方来源时才给 ticket 或 info 链接，所有链接必须使用 HTTPS；否则给 Google Maps 搜索链接并在文字中提示复核。5. 不承诺实时交通，notice 用一句话说明已核验的范围以及仍需临行复核的事项。6. 输出简体中文，日期覆盖用户范围，最多10天。7. 最终回复只能是符合指定结构的 JSON，不要附加 Markdown、引用列表或解释。${jsonInstruction}`;
     const responseBody = apiMode === "chat_completions"
       ? {
-          model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
+          model: ai.model,
           messages: [
-            { role: "system", content: "You are a travel planner. Always return valid JSON only." },
+            { role: "system", content: "You are the ROAM travel-planning agent. Use your enabled read-only research tools when current facts matter. Never execute shell commands or modify files. Return valid JSON only." },
             { role: "user", content: prompt },
           ],
-          response_format: structuredOutput === "json_object"
-            ? { type: "json_object" }
-            : { type: "json_schema", json_schema: { name: "travel_plan", strict: true, schema } },
+          ...(ai.backend === "hermes" ? {} : {
+            response_format: structuredOutput === "json_object"
+              ? { type: "json_object" }
+              : { type: "json_schema", json_schema: { name: "travel_plan", strict: true, schema } },
+          }),
         }
       : {
-          model: process.env.OPENAI_MODEL || "gpt-5.4-mini",
+          model: ai.model,
           ...(webSearchEnabled ? { tools: [{ type: "web_search", search_context_size: "low" }] } : {}),
           input: prompt,
           text: { format: { type: "json_schema", name: "travel_plan", strict: true, schema } },
         };
+    const sessionId = `roam-${crypto.randomUUID()}`;
+    const requestedTimeout = Number(process.env.AI_REQUEST_TIMEOUT_MS) || (ai.backend === "hermes" ? 180_000 : 90_000);
+    const timeout = Math.min(Math.max(requestedTimeout, 10_000), 600_000);
     const apiResponse = await fetch(`${baseUrl}/${apiMode === "chat_completions" ? "chat/completions" : "responses"}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ai.apiKey}`,
+        ...(ai.backend === "hermes" ? { "X-Hermes-Session-Id": sessionId, "Idempotency-Key": sessionId } : {}),
+      },
       body: JSON.stringify(responseBody),
+      signal: AbortSignal.timeout(timeout),
     });
     if (!apiResponse.ok) throw new Error(`LLM API ${apiResponse.status}: ${(await apiResponse.text()).slice(0, 300)}`);
     const raw = await apiResponse.json();
     const text = apiMode === "chat_completions" ? extractChatText(raw) : extractText(raw);
     if (!text) throw new Error("模型没有返回可用的行程。请稍后重试。");
-    return NextResponse.json({ plan: parseModelJson(text), demo: false });
+    return NextResponse.json({ plan: validatePlan(parseModelJson(text)), demo: false, backend: ai.backend });
   } catch (error) {
     console.error(error);
-    return NextResponse.json({ error: error instanceof Error ? error.message : "生成失败，请稍后重试。" }, { status: 500 });
+    const message = error instanceof Error && error.name === "TimeoutError"
+      ? "智能体检索超时，请缩短日期范围或稍后重试。"
+      : error instanceof Error ? error.message : "生成失败，请稍后重试。";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

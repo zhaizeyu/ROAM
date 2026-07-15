@@ -1,0 +1,34 @@
+# 挂载到 Hermes 容器的 /opt/data/config.yaml。
+# 密钥不要写进这个文件；NEW_API_KEY 由 Coolify Runtime Variables 注入。
+custom_providers:
+  - name: new-api
+    base_url: "${NEW_API_BASE_URL}"
+    key_env: NEW_API_KEY
+    api_mode: chat_completions
+
+model:
+  default: "${NEW_API_MODEL}"
+  provider: custom:new-api
+
+# DDGS 无需单独申请搜索 Key。它只提供搜索结果，不负责复杂网页抓取。
+web:
+  backend: ddgs
+
+# API Server 只开放只读研究工具。不要给公网用户 terminal/file 权限。
+platform_toolsets:
+  api_server:
+    - safe
+
+agent:
+  disabled_toolsets:
+    - terminal
+    - file
+    - code_execution
+    - memory
+    - skills
+    - delegation
+    - cronjob
+    - messaging
+
+compression:
+  enabled: false
