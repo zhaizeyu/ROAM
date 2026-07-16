@@ -221,6 +221,11 @@ function sanitizePlan(plan: unknown) {
   return candidate;
 }
 
+function timeMinutes(value: unknown) {
+  const match = typeof value === "string" ? value.match(/(?:^|\D)([01]?\d|2[0-3]):([0-5]\d)/) : null;
+  return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+}
+
 function validatePlan(plan: unknown, input: PlannerInput) {
   if (!plan || typeof plan !== "object") throw new Error("智能体返回的行程格式无效。");
   const candidate = plan as { destination?: unknown; dateLabel?: unknown; days?: Array<{ id?: unknown; date?: unknown; title?: unknown; summary?: unknown; stops?: Array<{ title?: unknown; text?: unknown; links?: Array<{ label?: unknown; url?: unknown }> }> }> };
@@ -239,6 +244,12 @@ function validatePlan(plan: unknown, input: PlannerInput) {
   if (candidate.days.some((day) => day.stops?.some((stop) => stop.links?.some((link) => typeof link.label !== "string" || /%[0-9a-f]{2}/i.test(link.label) || typeof link.url !== "string")))) {
     throw new Error("智能体返回的路线链接格式无效，请重新生成。");
   }
+  for (const day of candidate.days) {
+    const times = (day.stops ?? []).map((stop) => timeMinutes((stop as { time?: unknown }).time)).filter((time): time is number => time !== null);
+    if (times.some((time, index) => index > 0 && time < times[index - 1])) throw new Error(`${String(day.date)} 的时间顺序前后颠倒，请重新规划。`);
+    const hasMap = (day.stops ?? []).some((stop) => stop.links?.some((link) => typeof link.url === "string" && /google\.[^/]+\/maps/.test(link.url)));
+    if (!hasMap) throw new Error(`${String(day.date)} 缺少可执行的 Google Maps 路线。`);
+  }
   if (input.tripMode === "leisure") {
     const prose = candidate.days.flatMap((day) => [day.title, day.summary, ...(day.stops ?? []).flatMap((stop) => [stop.title, stop.text])]).filter((item): item is string => typeof item === "string").join(" ");
     if (/(下班|白天.*工作|完成工作|出差)/.test(prose)) throw new Error("休闲旅行中出现了工作日安排，请重新生成。");
@@ -249,10 +260,7 @@ function validatePlan(plan: unknown, input: PlannerInput) {
     const date = typeof day.date === "string" ? new Date(`${day.date}T12:00:00`) : null;
     const workday = input.tripMode === "work" && date && date.getDay() > 0 && date.getDay() < 6;
     if (explicitlyPartial || workday) continue;
-    const times = (day.stops ?? []).map((stop) => {
-      const match = typeof (stop as { time?: unknown }).time === "string" ? (stop as { time: string }).time.match(/(?:^|\D)([01]?\d|2[0-3]):([0-5]\d)/) : null;
-      return match ? Number(match[1]) * 60 + Number(match[2]) : null;
-    }).filter((time): time is number => time !== null);
+    const times = (day.stops ?? []).map((stop) => timeMinutes((stop as { time?: unknown }).time)).filter((time): time is number => time !== null);
     const hasMorning = times.some((time) => time <= 11 * 60 + 30);
     const hasAfternoon = times.some((time) => time >= 14 * 60);
     const hasEvening = times.some((time) => time >= 17 * 60);
