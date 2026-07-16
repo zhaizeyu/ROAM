@@ -26,6 +26,7 @@ type PlannerInput = {
   destination: string; base: string; startDate: string; endDate: string; tripMode: "work" | "leisure";
   weekdayWindow: string; weekendWindow: string; pace: string; interests: string[]; mustDo: string; constraints: string;
 };
+type EditorState = { kind: "edit"; index: number } | { kind: "insert"; index: number } | { kind: "replan" } | null;
 
 const hotel = "Exe Convention Plaza Madrid";
 const mapLink = (destination: string, mode = "transit", origin = hotel, waypoints = "") =>
@@ -35,7 +36,7 @@ const samplePlans: DayPlan[] = [
   {
     id: "wed",
     short: "15",
-    date: "7月15日",
+    date: "2026-07-15",
     weekday: "周三",
     title: "抵达节奏",
     summary: "恢复体力，在酒店附近轻松吃饭，看第二场半决赛。",
@@ -49,7 +50,7 @@ const samplePlans: DayPlan[] = [
   {
     id: "thu",
     short: "16",
-    date: "7月16日",
+    date: "2026-07-16",
     weekday: "周四",
     title: "伯纳乌夜游",
     summary: "离酒店最近的一次城市夜游：球场外观、卡斯蒂利亚大道和晚餐。",
@@ -64,7 +65,7 @@ const samplePlans: DayPlan[] = [
   {
     id: "fri",
     short: "17",
-    date: "7月17日",
+    date: "2026-07-17",
     weekday: "周五",
     title: "老城与 Tapas",
     summary: "把太阳门、马约尔广场和 La Latina 串成一条不走回头路的晚间路线。",
@@ -80,7 +81,7 @@ const samplePlans: DayPlan[] = [
   {
     id: "sat",
     short: "18",
-    date: "7月18日",
+    date: "2026-07-18",
     weekday: "周六",
     title: "王宫与日落",
     summary: "上午看王宫，下午回酒店避暑，晚上去德波神庙看马德里日落。",
@@ -98,7 +99,7 @@ const samplePlans: DayPlan[] = [
   {
     id: "sun",
     short: "19",
-    date: "7月19日",
+    date: "2026-07-19",
     weekday: "周日",
     title: "普拉多与决赛",
     summary: "白天看普拉多；赛前到官方大屏拍照，比赛在有座位和食物的体育酒吧观看。",
@@ -140,6 +141,7 @@ const sampleInput: PlannerInput = {
 
 const interestOptions = ["城市地标", "博物馆", "本地美食", "历史建筑", "足球氛围", "街区漫步", "自然公园", "购物", "夜生活"];
 const loadingStages = ["核对目的地与日期", "搜索官方开放和票务信息", "优化每天的地理顺序", "整理地图路线与最终计划"];
+const blankStop = (): Stop => ({ time: "15:00", title: "", text: "", meta: "", links: [], accent: "blue" });
 
 function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
   form: PlannerInput;
@@ -242,6 +244,11 @@ export default function Home() {
   const [trip, setTrip] = useState<TripResult>({ destination: "马德里", subtitle: "5天 · 2个重点景点 · 1场世界杯决赛", base: hotel, dateLabel: "15—19 JUL · 2026", notice: "L10施工提醒：Plaza de Castilla—Nuevos Ministerios停运。市中心方向在 Plaza de Castilla 换L1。", days: samplePlans });
   const [active, setActive] = useState("wed");
   const [done, setDone] = useState<Record<string, boolean>>({});
+  const [editor, setEditor] = useState<EditorState>(null);
+  const [draftStop, setDraftStop] = useState<Stop>(blankStop);
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [editorLoading, setEditorLoading] = useState(false);
+  const [editorError, setEditorError] = useState("");
 
   useEffect(() => {
     const saved = window.localStorage.getItem("madrid-trip-done");
@@ -269,6 +276,53 @@ export default function Home() {
   }
   function startNewPlan() { setForm(emptyInput); setLastInput(emptyInput); setView("planner"); window.scrollTo({ top: 0 }); }
   function editPlan() { setForm(lastInput); setView("planner"); window.scrollTo({ top: 0 }); }
+  function updateCurrentDay(nextDay: DayPlan) {
+    setTrip((currentTrip) => ({ ...currentTrip, days: currentTrip.days.map((day) => day.id === nextDay.id ? nextDay : day) }));
+    setDone({});
+  }
+  function openEdit(index: number) { setDraftStop(structuredClone(current.stops[index])); setEditorError(""); setEditor({ kind: "edit", index }); }
+  function openInsert(index: number) {
+    const previousTime = current.stops[index - 1]?.time;
+    setDraftStop({ ...blankStop(), time: /^\d{2}:\d{2}$/.test(previousTime ?? "") ? previousTime! : "15:00" });
+    setAiInstruction(""); setEditorError(""); setEditor({ kind: "insert", index });
+  }
+  function openReplan() { setAiInstruction(""); setEditorError(""); setEditor({ kind: "replan" }); }
+  function closeEditor() { if (!editorLoading) { setEditor(null); setEditorError(""); } }
+  function saveStop() {
+    if (!editor || editor.kind === "replan" || !draftStop.time.trim() || !draftStop.title.trim() || !draftStop.text.trim()) {
+      setEditorError("请填写时间、地点名称和具体说明。"); return;
+    }
+    const stops = [...current.stops];
+    const normalized = { ...draftStop, time: draftStop.time.trim(), title: draftStop.title.trim(), text: draftStop.text.trim(), meta: draftStop.meta?.trim() };
+    if (editor.kind === "edit") stops[editor.index] = normalized;
+    else stops.splice(editor.index, 0, { ...normalized, links: [{ label: `在地图中查看${normalized.title}`, url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${normalized.title} ${trip.destination}`)}`, kind: "map" }] });
+    updateCurrentDay({ ...current, stops }); closeEditor();
+  }
+  function removeStop(index: number) {
+    if (current.stops.length <= 2 || !window.confirm(`确定删除“${current.stops[index].title}”吗？`)) return;
+    updateCurrentDay({ ...current, stops: current.stops.filter((_, itemIndex) => itemIndex !== index) });
+  }
+  function moveStop(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= current.stops.length) return;
+    const stops = [...current.stops];
+    [stops[index], stops[target]] = [stops[target], stops[index]];
+    updateCurrentDay({ ...current, stops });
+  }
+  async function replanDay() {
+    if (!editor || !aiInstruction.trim() && !(editor.kind === "insert" && draftStop.title.trim())) { setEditorError("请告诉 AI 想怎样调整当天路线。"); return; }
+    setEditorLoading(true); setEditorError("");
+    const instruction = editor.kind === "insert"
+      ? `在第 ${editor.index} 个位置插入“${draftStop.title.trim()}”。期望时间：${draftStop.time.trim() || "由你安排"}。补充说明：${draftStop.text.trim() || "无"}。${aiInstruction.trim()}`
+      : aiInstruction.trim();
+    try {
+      const response = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "replan-day", input: lastInput, trip, dayId: current.id, instruction }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "局部重规划失败，请稍后重试。");
+      setTrip(data.plan); setDone({}); setEditor(null);
+    } catch (reason) { setEditorError(reason instanceof Error ? reason.message : "局部重规划失败，请稍后重试。"); }
+    finally { setEditorLoading(false); }
+  }
 
   if (view === "planner") return <PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample}/>;
 
@@ -319,7 +373,7 @@ export default function Home() {
           </div>
           <div className="day-heading">
             <div><span>{current.date} · {current.weekday}</span><h2>{current.title}</h2><p>{current.summary}</p></div>
-            <div className="pace"><small>当天强度</small><strong>{current.distance}</strong></div>
+            <div className="day-tools"><div className="pace"><small>当天强度</small><strong>{current.distance}</strong></div><button onClick={openReplan}>✦ AI 调整当天</button></div>
           </div>
 
           <div className="timeline">
@@ -333,6 +387,7 @@ export default function Home() {
                     <div className="stop-top"><h3>{stop.title}</h3>{stop.meta && <span>{stop.meta}</span>}</div>
                     <p>{stop.text}</p>
                     {stop.links && <div className="actions">{stop.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer" className={link.kind ?? "map"}>{link.kind === "ticket" ? <TicketIcon/> : <RouteIcon/>}{link.label}<span>↗</span></a>)}</div>}
+                    <div className="stop-edit-tools"><button onClick={() => openEdit(index)}>编辑</button><button onClick={() => moveStop(index, -1)} disabled={index === 0}>↑ 上移</button><button onClick={() => moveStop(index, 1)} disabled={index === current.stops.length - 1}>↓ 下移</button><button onClick={() => openInsert(index + 1)}>＋ 接着插入</button><button className="danger" onClick={() => removeStop(index)}>删除</button></div>
                   </div>
                 </article>
               );
@@ -340,6 +395,22 @@ export default function Home() {
           </div>
         </section>
       </div>
+
+      {editor && <div className="editor-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeEditor(); }}>
+        <section className="trip-editor" role="dialog" aria-modal="true" aria-label={editor.kind === "edit" ? "编辑行程站点" : editor.kind === "insert" ? "插入行程站点" : "AI 调整当天"}>
+          <div className="editor-head"><div><small>ROAM 行程编辑器</small><h2>{editor.kind === "edit" ? "编辑这一站" : editor.kind === "insert" ? "插入一个地点" : `调整 ${current.date} 的路线`}</h2></div><button onClick={closeEditor} aria-label="关闭编辑器">×</button></div>
+          {editor.kind !== "replan" && <div className="editor-fields">
+            <label><span>时间</span><input value={draftStop.time} onChange={(event) => setDraftStop({ ...draftStop, time: event.target.value })} placeholder="例如 15:30"/></label>
+            <label><span>地点 / 活动名称</span><input value={draftStop.title} onChange={(event) => setDraftStop({ ...draftStop, title: event.target.value })} placeholder="例如 塞切尼温泉"/></label>
+            <label className="wide"><span>具体说明</span><textarea value={draftStop.text} onChange={(event) => setDraftStop({ ...draftStop, text: event.target.value })} placeholder="停留多久、想做什么、交通或用餐要求"/></label>
+            <label className="wide"><span>时间 / 体力备注</span><input value={draftStop.meta ?? ""} onChange={(event) => setDraftStop({ ...draftStop, meta: event.target.value })} placeholder="例如 停留约90分钟 · 可坐下休息"/></label>
+          </div>}
+          {editor.kind !== "edit" && <label className="editor-ai"><span>{editor.kind === "insert" ? "交给 AI 的补充要求（可选）" : "你想怎样修改当天？"}</span><textarea value={aiInstruction} onChange={(event) => setAiInstruction(event.target.value)} placeholder={editor.kind === "insert" ? "例如：插入后仍要保留晚餐，避免跨城折返" : "例如：下午加入塞切尼温泉，减少步行，晚餐安排在20:00前"}/></label>}
+          <div className="editor-note">改动仅保存在当前页面；AI 局部重规划只会替换这一天。</div>
+          {editorError && <div className="form-error" role="alert">{editorError}</div>}
+          <div className="editor-actions"><button className="secondary" onClick={closeEditor}>取消</button>{editor.kind !== "replan" && <button className="secondary" onClick={saveStop}>直接保存</button>}{editor.kind !== "edit" && <button className="primary" disabled={editorLoading} onClick={replanDay}>{editorLoading ? <><i className="spinner"/> AI 正在重排当天...</> : <>✦ AI {editor.kind === "insert" ? "插入并优化" : "局部重规划"}</>}</button>}</div>
+        </section>
+      </div>}
 
       <section className="quick-guide">
         <div className="guide-intro"><span>随身指南</span><h2>出门之前，<br/>记住这四件事。</h2></div>
