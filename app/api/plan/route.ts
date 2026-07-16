@@ -55,10 +55,13 @@ function datesBetween(start: string, end: string) {
   const first = new Date(`${start}T12:00:00`);
   const last = new Date(`${end}T12:00:00`);
   if (Number.isNaN(first.getTime()) || Number.isNaN(last.getTime()) || last < first) return [];
+  if (Math.round((last.getTime() - first.getTime()) / 86_400_000) > 9) return [];
   const dates: Date[] = [];
-  for (const date = new Date(first); date <= last && dates.length < 10; date.setDate(date.getDate() + 1)) dates.push(new Date(date));
+  for (const date = new Date(first); date <= last; date.setDate(date.getDate() + 1)) dates.push(new Date(date));
   return dates;
 }
+
+const isoDate = (date: Date) => date.toISOString().slice(0, 10);
 
 function demoPlan(input: PlannerInput) {
   const dates = datesBetween(input.startDate, input.endDate);
@@ -66,7 +69,7 @@ function demoPlan(input: PlannerInput) {
   const weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
   const days = (dates.length ? dates : [new Date()]).map((date, index) => {
     const workday = input.tripMode === "work" && date.getDay() > 0 && date.getDay() < 6;
-    const dateText = new Intl.DateTimeFormat("zh-CN", { month: "long", day: "numeric" }).format(date);
+    const dateText = isoDate(date);
     const center = `${input.destination} city center`;
     const oldTown = `${input.destination} old town`;
     const localFood = `${input.destination} local restaurant`;
@@ -126,7 +129,7 @@ const schema = {
         properties: {
           id: { type: "string" },
           short: { type: "string" },
-          date: { type: "string" },
+          date: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
           weekday: { type: "string" },
           title: { type: "string" },
           summary: { type: "string" },
@@ -191,14 +194,46 @@ function parseModelJson(text: string) {
   }
 }
 
-function validatePlan(plan: unknown) {
+function humanizeLabel(label: unknown) {
+  let value = typeof label === "string" ? label.trim() : "打开链接";
+  for (let attempt = 0; attempt < 2 && /%[0-9a-f]{2}/i.test(value); attempt += 1) {
+    try { value = decodeURIComponent(value); } catch { break; }
+  }
+  return value.replace(/\+/g, " ").replace(/\s+/g, " ").slice(0, 80) || "打开链接";
+}
+
+function sanitizePlan(plan: unknown) {
+  if (!plan || typeof plan !== "object") return plan;
+  const candidate = structuredClone(plan) as { days?: Array<{ stops?: Array<{ links?: Array<{ label?: unknown; url?: unknown; kind?: unknown }> }> }> };
+  for (const day of candidate.days ?? []) for (const stop of day.stops ?? []) {
+    stop.links = (stop.links ?? []).filter((link) => {
+      try { return typeof link.url === "string" && new URL(link.url).protocol === "https:"; } catch { return false; }
+    }).map((link) => ({ ...link, label: humanizeLabel(link.label) }));
+  }
+  return candidate;
+}
+
+function validatePlan(plan: unknown, input: PlannerInput) {
   if (!plan || typeof plan !== "object") throw new Error("智能体返回的行程格式无效。");
-  const candidate = plan as { destination?: unknown; days?: Array<{ stops?: unknown[] }> };
+  const candidate = plan as { destination?: unknown; dateLabel?: unknown; days?: Array<{ id?: unknown; date?: unknown; title?: unknown; summary?: unknown; stops?: Array<{ title?: unknown; text?: unknown; links?: Array<{ label?: unknown; url?: unknown }> }> }> };
   if (typeof candidate.destination !== "string" || !Array.isArray(candidate.days) || candidate.days.length < 1 || candidate.days.length > 10) {
     throw new Error("智能体返回的行程缺少必要字段。");
   }
+  const expectedDates = datesBetween(input.startDate, input.endDate).map(isoDate);
+  const actualDates = candidate.days.map((day) => day.date);
+  if (candidate.days.length !== expectedDates.length || actualDates.some((date, index) => date !== expectedDates[index])) {
+    throw new Error(`智能体返回的日期与需求不一致（应为 ${expectedDates.join("、")}），请重新生成。`);
+  }
   if (candidate.days.some((day) => !Array.isArray(day.stops) || day.stops.length < 2 || day.stops.length > 9)) {
     throw new Error("智能体返回的每日行程格式无效。");
+  }
+  if (new Set(candidate.days.map((day) => day.id)).size !== candidate.days.length) throw new Error("智能体返回了重复的日期标识，请重新生成。");
+  if (candidate.days.some((day) => day.stops?.some((stop) => stop.links?.some((link) => typeof link.label !== "string" || /%[0-9a-f]{2}/i.test(link.label) || typeof link.url !== "string")))) {
+    throw new Error("智能体返回的路线链接格式无效，请重新生成。");
+  }
+  if (input.tripMode === "leisure") {
+    const prose = candidate.days.flatMap((day) => [day.title, day.summary, ...(day.stops ?? []).flatMap((stop) => [stop.title, stop.text])]).filter((item): item is string => typeof item === "string").join(" ");
+    if (/(下班|白天.*工作|完成工作|出差)/.test(prose)) throw new Error("休闲旅行中出现了工作日安排，请重新生成。");
   }
   return plan;
 }
@@ -207,7 +242,8 @@ export async function POST(request: Request) {
   try {
     const input = normalizeInput((await request.json()) as PlannerInput);
     if (!input.destination?.trim() || !input.startDate || !input.endDate) return NextResponse.json({ error: "请填写目的地和出行日期。" }, { status: 400 });
-    if (datesBetween(input.startDate, input.endDate).length === 0) return NextResponse.json({ error: "结束日期不能早于开始日期，单次最多规划10天。" }, { status: 400 });
+    const requestedDates = datesBetween(input.startDate, input.endDate);
+    if (requestedDates.length === 0) return NextResponse.json({ error: "结束日期不能早于开始日期，单次最多规划10天。" }, { status: 400 });
     const ai = getAIConfig();
     if (!ai.apiKey) return NextResponse.json({ plan: demoPlan(input), demo: true });
 
@@ -225,19 +261,23 @@ export async function POST(request: Request) {
       ? configuredOutputMode
       : apiMode === "chat_completions" && !isOfficialOpenAI ? "json_object" : "json_schema";
     const verificationRule = ai.backend === "hermes"
-      ? "必须主动调用 web_search 核对动态信息，优先使用景点、交通机构、赛事组织方和票务方的官方来源；如果工具不可用或无法核实，必须明确写入 notice，不得假装已经核验。"
+      ? "必须主动调用 web_search 核对动态信息，优先使用景点、交通机构、赛事组织方和票务方的官方来源。只允许调用 web_search，绝对不要调用 web_extract（当前后端不支持正文提取）。如果无法核实，必须明确写入 notice，不得假装已经核验。"
       : webSearchEnabled
       ? "使用网络搜索核对景点营业时间、交通施工和官方购票网站。"
       : "当前没有网络搜索工具，不得声称已经实时核验；所有开放时间和票务信息都要提示用户临行前复核。";
+    const expectedDates = requestedDates.map(isoDate);
+    const modeRule = input.tripMode === "leisure"
+      ? "这是纯休闲旅行：每天均可完整安排，必须完全忽略 weekdayWindow，不得出现工作、下班、出差或白天办公等表述；按照每日可用时间和休息偏好安排。"
+      : `这是出差加游玩：工作日只能在“${input.weekdayWindow || "用户指定的晚间"}”安排活动，周末/休息日遵守“${input.weekendWindow || "全天可用"}”。`;
     const jsonInstruction = structuredOutput === "json_object"
-      ? `\n7. 只输出合法 JSON，不要输出 Markdown 或解释。JSON 必须严格符合这个结构：${JSON.stringify(schema)}`
+      ? `\n10. 只输出合法 JSON，不要输出 Markdown 或解释。JSON 必须严格符合这个结构：${JSON.stringify(schema)}`
       : "";
-    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. 工作日严格尊重可用时段，适度安排并保留休息。2. ${verificationRule} 3. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。4. 只有确认是官方来源时才给 ticket 或 info 链接，所有链接必须使用 HTTPS；否则给 Google Maps 搜索链接并在文字中提示复核。5. 不承诺实时交通，notice 用一句话说明已核验的范围以及仍需临行复核的事项。6. 输出简体中文，日期覆盖用户范围，最多10天。7. 最终回复只能是符合指定结构的 JSON，不要附加 Markdown、引用列表或解释。${jsonInstruction}`;
+    const prompt = `你是一位谨慎、懂路线优化的中文旅行规划师。根据用户资料生成可直接执行的逐日计划。\n用户资料：${JSON.stringify(input)}\n要求：1. ${modeRule} 2. 日期必须严格且仅覆盖 ${expectedDates.join("、")}，每天恰好一个 day；day.date 必须使用对应的 YYYY-MM-DD，day.short 使用两位日期。3. ${verificationRule} 4. 路线不走回头路；每段 Google Maps 链接使用 https://www.google.com/maps/dir/?api=1&origin=...&destination=...&travelmode=...，地点用完整可搜索名称。5. link.label 必须是人类可读的简体中文或正常地名，绝不能出现 %20、%C3 等 URL 编码；编码只能放在 url 字段。6. 只有确认是官方来源时才给 ticket 或 info 链接，所有链接必须使用 HTTPS；否则给 Google Maps 搜索链接并在文字中提示复核。7. 严格执行 mustDo 和 constraints；若存在步行、站立、午休或饮食限制，每天的路线和 meta 必须体现。8. 不承诺实时交通，notice 用一句话说明已核验的范围以及仍需临行复核的事项。9. 输出简体中文；最终回复只能是符合指定结构的 JSON，不要附加 Markdown、引用列表或解释。${jsonInstruction}`;
     const responseBody = apiMode === "chat_completions"
       ? {
           model: ai.model,
           messages: [
-            { role: "system", content: "You are the ROAM travel-planning agent. Use your enabled read-only research tools when current facts matter. Never execute shell commands or modify files. Return valid JSON only." },
+            { role: "system", content: "You are the ROAM travel-planning agent. Use web_search for current facts. Never call web_extract, execute shell commands, or modify files. Obey the requested dates and trip mode exactly. Return valid JSON only." },
             { role: "user", content: prompt },
           ],
           ...(ai.backend === "hermes" ? {} : {
@@ -269,7 +309,8 @@ export async function POST(request: Request) {
     const raw = await apiResponse.json();
     const text = apiMode === "chat_completions" ? extractChatText(raw) : extractText(raw);
     if (!text) throw new Error("模型没有返回可用的行程。请稍后重试。");
-    return NextResponse.json({ plan: validatePlan(parseModelJson(text)), demo: false, backend: ai.backend });
+    const plan = sanitizePlan(parseModelJson(text));
+    return NextResponse.json({ plan: validatePlan(plan, input), demo: false, backend: ai.backend });
   } catch (error) {
     console.error(error);
     const message = error instanceof Error && error.name === "TimeoutError"

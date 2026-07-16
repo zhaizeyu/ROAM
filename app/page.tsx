@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type LinkItem = { label: string; url: string; kind?: "map" | "ticket" | "info" };
 type Stop = {
@@ -23,7 +23,7 @@ type DayPlan = {
 };
 type TripResult = { destination: string; subtitle: string; base: string; dateLabel: string; notice: string; days: DayPlan[] };
 type PlannerInput = {
-  destination: string; base: string; startDate: string; endDate: string; tripMode: string;
+  destination: string; base: string; startDate: string; endDate: string; tripMode: "work" | "leisure";
   weekdayWindow: string; weekendWindow: string; pace: string; interests: string[]; mustDo: string; constraints: string;
 };
 
@@ -125,7 +125,13 @@ function TicketIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h13A1.5 1.5 0 0 1 20 7.5V10a2 2 0 0 0 0 4v2.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 16.5V14a2 2 0 0 0 0-4V7.5Z"/><path d="M12 8.5v7" /></svg>;
 }
 
-const initialInput: PlannerInput = {
+const emptyInput: PlannerInput = {
+  destination: "", base: "", startDate: "", endDate: "", tripMode: "work",
+  weekdayWindow: "工作日19:00后", weekendWindow: "周末全天，下午可安排休息", pace: "适中",
+  interests: [], mustDo: "", constraints: "",
+};
+
+const sampleInput: PlannerInput = {
   destination: "马德里", base: "Exe Convention Plaza Madrid", startDate: "2026-07-15", endDate: "2026-07-19",
   tripMode: "work", weekdayWindow: "工作日19:00后", weekendWindow: "周末全天，下午可回酒店休息", pace: "适中",
   interests: ["城市地标", "本地美食", "足球氛围"], mustDo: "周日晚上看世界杯决赛，想先拍官方户外大屏，再去有座位和食物的酒吧看球。",
@@ -133,25 +139,44 @@ const initialInput: PlannerInput = {
 };
 
 const interestOptions = ["城市地标", "博物馆", "本地美食", "历史建筑", "足球氛围", "街区漫步", "自然公园", "购物", "夜生活"];
+const loadingStages = ["核对目的地与日期", "搜索官方开放和票务信息", "优化每天的地理顺序", "整理地图路线与最终计划"];
 
-function PlannerHome({ onGenerated, onSample }: { onGenerated: (plan: TripResult) => void; onSample: () => void }) {
+function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
+  form: PlannerInput;
+  onFormChange: (next: PlannerInput) => void;
+  onGenerated: (plan: TripResult, input: PlannerInput) => void;
+  onSample: () => void;
+}) {
   const [step, setStep] = useState(1);
-  const [form, setForm] = useState(initialInput);
   const [loading, setLoading] = useState(false);
+  const [loadingStage, setLoadingStage] = useState(0);
   const [error, setError] = useState("");
-  const set = (key: keyof PlannerInput, value: string | string[]) => setForm((current) => ({ ...current, [key]: value }));
+  const controllerRef = useRef<AbortController | null>(null);
+  const set = <K extends keyof PlannerInput>(key: K, value: PlannerInput[K]) => onFormChange({ ...form, [key]: value });
   const toggleInterest = (item: string) => set("interests", form.interests.includes(item) ? form.interests.filter((x) => x !== item) : [...form.interests, item]);
+
+  useEffect(() => {
+    if (!loading) { setLoadingStage(0); return; }
+    const timers = [window.setTimeout(() => setLoadingStage(1), 7000), window.setTimeout(() => setLoadingStage(2), 19000), window.setTimeout(() => setLoadingStage(3), 38000)];
+    return () => timers.forEach(window.clearTimeout);
+  }, [loading]);
 
   async function generate() {
     setLoading(true); setError("");
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const payload = { ...form, weekdayWindow: form.tripMode === "leisure" ? "" : form.weekdayWindow };
     try {
-      const response = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(form) });
+      const response = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: controller.signal });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "生成失败，请稍后重试。");
-      onGenerated(data.plan);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "生成失败，请稍后重试。"); }
-    finally { setLoading(false); }
+      onGenerated(data.plan, form);
+    } catch (reason) {
+      setError(reason instanceof DOMException && reason.name === "AbortError" ? "已取消本次生成，你可以修改需求后重新开始。" : reason instanceof Error ? reason.message : "生成失败，请稍后重试。");
+    } finally { controllerRef.current = null; setLoading(false); }
   }
+
+  function cancelGeneration() { controllerRef.current?.abort(); }
 
   return <main className="planner-page">
     <nav className="product-nav">
@@ -173,12 +198,12 @@ function PlannerHome({ onGenerated, onSample }: { onGenerated: (plan: TripResult
         {step === 1 && <div className="form-step">
           <label className="field full"><span>你想去哪里？</span><input value={form.destination} onChange={(e) => set("destination", e.target.value)} placeholder="城市或地区，例如：马德里"/></label>
           <label className="field full"><span>住在哪里？ <small>可稍后决定</small></span><input value={form.base} onChange={(e) => set("base", e.target.value)} placeholder="酒店、街区或地址"/></label>
-          <div className="field-pair"><label className="field"><span>开始日期</span><input type="date" value={form.startDate} onChange={(e) => set("startDate", e.target.value)}/></label><label className="field"><span>结束日期</span><input type="date" value={form.endDate} min={form.startDate} onChange={(e) => set("endDate", e.target.value)}/></label></div>
+          <div className="field-pair"><label className="field"><span>开始日期</span><input type="date" value={form.startDate} onInput={(e) => set("startDate", e.currentTarget.value)} onChange={(e) => set("startDate", e.target.value)}/></label><label className="field"><span>结束日期</span><input type="date" value={form.endDate} min={form.startDate} onInput={(e) => set("endDate", e.currentTarget.value)} onChange={(e) => set("endDate", e.target.value)}/></label></div>
         </div>}
         {step === 2 && <div className="form-step">
           <div className="field full"><span className="field-label">这次是什么旅行？</span><div className="choice-grid"><button className={form.tripMode === "work" ? "selected" : ""} onClick={() => set("tripMode", "work")}><b>💼 出差 + 游玩</b><small>工作日只安排下班后</small></button><button className={form.tripMode === "leisure" ? "selected" : ""} onClick={() => set("tripMode", "leisure")}><b>🌤 纯休闲旅行</b><small>每天都可以完整安排</small></button></div></div>
-          <label className="field full"><span>工作日可用时间</span><input value={form.weekdayWindow} onChange={(e) => set("weekdayWindow", e.target.value)} placeholder="例如：每天 19:00 以后"/></label>
-          <label className="field full"><span>周末 / 休息日</span><input value={form.weekendWindow} onChange={(e) => set("weekendWindow", e.target.value)} placeholder="例如：全天，但下午想午休"/></label>
+          {form.tripMode === "work" && <label className="field full"><span>工作日可用时间</span><input value={form.weekdayWindow} onChange={(e) => set("weekdayWindow", e.target.value)} placeholder="例如：每天 19:00 以后"/></label>}
+          <label className="field full"><span>{form.tripMode === "work" ? "周末 / 休息日" : "每天可用时间 / 休息偏好"}</span><input value={form.weekendWindow} onChange={(e) => set("weekendWindow", e.target.value)} placeholder={form.tripMode === "work" ? "例如：全天，但下午想午休" : "例如：每天全天，下午安排一次休息"}/></label>
           <div className="field full"><span className="field-label">旅行节奏</span><div className="pace-options">{["轻松", "适中", "充实"].map((item) => <button key={item} className={form.pace === item ? "selected" : ""} onClick={() => set("pace", item)}>{item}</button>)}</div></div>
         </div>}
         {step === 3 && <div className="form-step">
@@ -187,10 +212,17 @@ function PlannerHome({ onGenerated, onSample }: { onGenerated: (plan: TripResult
           <label className="field full"><span>体力、饮食或其他限制</span><input value={form.constraints} onChange={(e) => set("constraints", e.target.value)} placeholder="例如：不想站太久、少走路、不吃辣"/></label>
         </div>}
 
-        {error && <div className="form-error">{error}</div>}
+        {loading && <div className="generation-status" aria-live="polite">
+          <div className="generation-status-head"><div><i className="spinner dark"/><strong>{loadingStages[loadingStage]}</strong></div><span>通常需要 45–90 秒</span></div>
+          <div className="generation-steps">{loadingStages.map((item, index) => <span key={item} className={index < loadingStage ? "done" : index === loadingStage ? "active" : ""}>{index < loadingStage ? "✓" : index + 1}<small>{item}</small></span>)}</div>
+          <p>正在优先核验官方来源并规划不走回头路的路线，请保持页面开启。</p>
+        </div>}
+        {error && <div className="form-error" role="alert">{error}</div>}
         <div className="form-actions">
-          {step > 1 && <button className="back" onClick={() => setStep(step - 1)}>← 上一步</button>}
-          {step < 3 ? <button className="next" disabled={step === 1 && (!form.destination || !form.startDate || !form.endDate)} onClick={() => setStep(step + 1)}>继续 <span>→</span></button> : <button className="generate" disabled={loading} onClick={generate}>{loading ? <><i className="spinner"/> 正在检索并规划...</> : <>生成我的完整行程 <span>✦</span></>}</button>}
+          {loading ? <button className="cancel" onClick={cancelGeneration}>取消生成</button> : <>
+            {step > 1 && <button className="back" onClick={() => setStep(step - 1)}>← 上一步</button>}
+            {step < 3 ? <button className="next" disabled={step === 1 && (!form.destination || !form.startDate || !form.endDate)} onClick={() => setStep(step + 1)}>继续 <span>→</span></button> : <button className="generate" onClick={generate}>生成我的完整行程 <span>✦</span></button>}
+          </>}
         </div>
         <div className="privacy-note">🔒 你的 LLM 密钥只保存在服务器端，不会发送到浏览器。</div>
       </div>
@@ -205,6 +237,8 @@ function PlannerHome({ onGenerated, onSample }: { onGenerated: (plan: TripResult
 
 export default function Home() {
   const [view, setView] = useState<"planner" | "result">("planner");
+  const [form, setForm] = useState<PlannerInput>(emptyInput);
+  const [lastInput, setLastInput] = useState<PlannerInput>(emptyInput);
   const [trip, setTrip] = useState<TripResult>({ destination: "马德里", subtitle: "5天 · 2个重点景点 · 1场世界杯决赛", base: hotel, dateLabel: "15—19 JUL · 2026", notice: "L10施工提醒：Plaza de Castilla—Nuevos Ministerios停运。市中心方向在 Plaza de Castilla 换L1。", days: samplePlans });
   const [active, setActive] = useState("wed");
   const [done, setDone] = useState<Record<string, boolean>>({});
@@ -225,13 +259,18 @@ export default function Home() {
   function toggle(key: string) {
     const next = { ...done, [key]: !done[key] };
     setDone(next);
-    window.localStorage.setItem("madrid-trip-done", JSON.stringify(next));
+    window.localStorage.setItem(`roam-trip-done:${trip.destination}:${trip.dateLabel}`, JSON.stringify(next));
   }
 
-  function showPlan(plan: TripResult) { setTrip(plan); setActive(plan.days[0].id); setDone({}); setView("result"); window.scrollTo({ top: 0 }); }
-  function showSample() { showPlan({ destination: "马德里", subtitle: "5天 · 2个重点景点 · 1场世界杯决赛", base: hotel, dateLabel: "15—19 JUL · 2026", notice: "L10施工提醒：Plaza de Castilla—Nuevos Ministerios停运。市中心方向在 Plaza de Castilla 换L1。", days: samplePlans }); }
+  function showPlan(plan: TripResult, input: PlannerInput) { setTrip(plan); setLastInput(input); setActive(plan.days[0].id); setDone({}); setView("result"); window.scrollTo({ top: 0 }); }
+  function showSample() {
+    setForm(sampleInput);
+    showPlan({ destination: "马德里", subtitle: "5天 · 2个重点景点 · 1场世界杯决赛", base: hotel, dateLabel: "15—19 JUL · 2026", notice: "L10施工提醒：Plaza de Castilla—Nuevos Ministerios停运。市中心方向在 Plaza de Castilla 换L1。", days: samplePlans }, sampleInput);
+  }
+  function startNewPlan() { setForm(emptyInput); setLastInput(emptyInput); setView("planner"); window.scrollTo({ top: 0 }); }
+  function editPlan() { setForm(lastInput); setView("planner"); window.scrollTo({ top: 0 }); }
 
-  if (view === "planner") return <PlannerHome onGenerated={showPlan} onSample={showSample}/>;
+  if (view === "planner") return <PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample}/>;
 
   return (
     <main>
@@ -239,10 +278,10 @@ export default function Home() {
         <div className="hero-art" aria-hidden="true"><span className="sun"/><span className="route-line one"/><span className="route-line two"/><span className="pin">{trip.destination.slice(0, 1)}</span></div>
         <nav className="topbar">
           <div className="brand"><span>R</span> ROAM · {trip.destination.toUpperCase()}</div>
-          <div className="result-nav"><button onClick={() => setView("planner")}>＋ 新建行程</button><div className="trip-dates">{trip.dateLabel}</div></div>
+          <div className="result-nav"><button onClick={startNewPlan}>＋ 新建行程</button><div className="trip-dates">{trip.dateLabel}</div></div>
         </nav>
         <div className="hero-copy">
-          <div className="eyebrow">出差中的城市漫游</div>
+          <div className="eyebrow">{lastInput.tripMode === "work" ? "出差中的城市漫游" : "属于你的城市假期"}</div>
           <h1>把时间留给风景，<br/><em>路线交给 ROAM。</em></h1>
           <p>{trip.subtitle}</p>
         </div>
@@ -256,7 +295,7 @@ export default function Home() {
       <section className="service-alert" aria-label="重要交通提醒">
         <div className="alert-mark">!</div>
         <div><strong>出发前提醒</strong><p>{trip.notice}</p></div>
-        <button className="edit-plan" onClick={() => setView("planner")}>编辑需求</button>
+        <button className="edit-plan" onClick={editPlan}>编辑需求</button>
       </section>
 
       <div className="app-shell">
