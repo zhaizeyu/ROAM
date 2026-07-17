@@ -143,6 +143,34 @@ const interestOptions = ["城市地标", "博物馆", "本地美食", "历史建
 const loadingStages = ["核对目的地与日期", "搜索官方开放和票务信息", "优化每天的地理顺序", "整理地图路线与最终计划"];
 const blankStop = (): Stop => ({ time: "15:00", title: "", text: "", meta: "", links: [], accent: "blue" });
 
+async function readJsonResponse(response: Response) {
+  const text = await response.text();
+  try { return JSON.parse(text); }
+  catch {
+    const proxyError = text.trimStart().startsWith("<") || response.headers.get("content-type")?.includes("text/html");
+    throw new Error(proxyError ? "网络代理暂时中断了规划请求，请稍后重试。" : "规划服务返回了无法解析的结果，请重新生成。");
+  }
+}
+
+async function requestPlan(payload: unknown, signal?: AbortSignal) {
+  const started = await fetch("/api/plan/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal });
+  const startData = await readJsonResponse(started);
+  if (!started.ok) throw new Error(startData.error || "无法启动规划任务，请稍后重试。");
+  const jobId = startData.jobId;
+  if (typeof jobId !== "string") throw new Error("规划服务没有返回任务编号，请重新生成。");
+  const deadline = Date.now() + 10 * 60_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    const response = await fetch(`/api/plan/jobs?id=${encodeURIComponent(jobId)}`, { cache: "no-store", signal });
+    const data = await readJsonResponse(response);
+    if (response.status === 202) continue;
+    if (!response.ok) throw new Error(data.error || "生成失败，请稍后重试。");
+    return data;
+  }
+  throw new Error("本次规划耗时过长，请缩短日期范围后重试。");
+}
+
 function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
   form: PlannerInput;
   onFormChange: (next: PlannerInput) => void;
@@ -169,9 +197,7 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
     controllerRef.current = controller;
     const payload = { ...form, weekdayWindow: form.tripMode === "leisure" ? "" : form.weekdayWindow };
     try {
-      const response = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal: controller.signal });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "生成失败，请稍后重试。");
+      const data = await requestPlan(payload, controller.signal);
       onGenerated(data.plan, form);
     } catch (reason) {
       setError(reason instanceof DOMException && reason.name === "AbortError" ? "已取消本次生成，你可以修改需求后重新开始。" : reason instanceof Error ? reason.message : "生成失败，请稍后重试。");
@@ -316,9 +342,7 @@ export default function Home() {
       ? `在第 ${editor.index} 个位置插入“${draftStop.title.trim()}”。期望时间：${draftStop.time.trim() || "由你安排"}。补充说明：${draftStop.text.trim() || "无"}。${aiInstruction.trim()}`
       : aiInstruction.trim();
     try {
-      const response = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "replan-day", input: lastInput, trip, dayId: current.id, instruction }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "局部重规划失败，请稍后重试。");
+      const data = await requestPlan({ action: "replan-day", input: lastInput, trip, dayId: current.id, instruction });
       setTrip(data.plan); setDone({}); setEditor(null);
     } catch (reason) { setEditorError(reason instanceof Error ? reason.message : "局部重规划失败，请稍后重试。"); }
     finally { setEditorLoading(false); }
