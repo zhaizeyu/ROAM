@@ -1,17 +1,16 @@
 import { NextResponse } from "next/server";
 import { listTrips } from "../../../lib/db";
+import { getAuthenticatedUser } from "../../../lib/auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const noStore = { "Cache-Control": "no-store" };
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 export async function GET(request: Request) {
   try {
-    const clientId = new URL(request.url).searchParams.get("clientId") ?? "";
-    if (!uuidPattern.test(clientId)) return NextResponse.json({ error: "浏览器标识无效。" }, { status: 400, headers: noStore });
-    const trips = await listTrips(clientId);
+    const user = await getAuthenticatedUser(request);
+    if (!user) return NextResponse.json({ error: "请先登录后查看历史行程。" }, { status: 401, headers: noStore });
+    const trips = await listTrips(user.id);
     return NextResponse.json({
       trips: trips.map((trip) => ({
         id: trip.id,

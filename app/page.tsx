@@ -24,6 +24,7 @@ type DayPlan = {
 type TripResult = { destination: string; subtitle: string; base: string; dateLabel: string; notice: string; days: DayPlan[] };
 type TripPersistence = { tripId: string; accessToken: string; version?: number };
 type HistoryItem = TripPersistence & { destination: string; startDate: string; endDate: string; subtitle: string; version: number; updatedAt: string };
+type AuthUser = { id: string; username: string; displayName: string; isTest: boolean };
 type PlannerInput = {
   destination: string; base: string; startDate: string; endDate: string; tripMode: "work" | "leisure";
   weekdayWindow: string; weekendWindow: string; pace: string; interests: string[]; mustDo: string; constraints: string;
@@ -181,12 +182,14 @@ async function requestPlan(payload: unknown, signal?: AbortSignal) {
   throw new Error("本次规划耗时过长，请缩短日期范围后重试。");
 }
 
-function PlannerHome({ form, onFormChange, onGenerated, onSample, onHistory }: {
+function PlannerHome({ form, onFormChange, onGenerated, onSample, onHistory, user, onLogout }: {
   form: PlannerInput;
   onFormChange: (next: PlannerInput) => void;
   onGenerated: (plan: TripResult, input: PlannerInput, persistence: TripPersistence) => void;
   onSample: () => void;
   onHistory: () => void;
+  user: AuthUser;
+  onLogout: () => void;
 }) {
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -220,7 +223,7 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample, onHistory }: {
   return <main className="planner-page">
     <nav className="product-nav">
       <div className="product-brand"><span>R</span><strong>ROAM</strong><small>AI TRIP PLANNER</small></div>
-      <div className="planner-nav-actions"><button onClick={onHistory}>历史行程</button><button onClick={onSample}>马德里示例 <span>↗</span></button></div>
+      <div className="planner-nav-actions"><span className="user-pill">{user.displayName}</span><button onClick={onHistory}>历史行程</button><button onClick={onSample}>马德里示例 <span>↗</span></button><button onClick={onLogout}>退出</button></div>
     </nav>
     <section className="planner-hero">
       <div className="planner-intro">
@@ -274,6 +277,50 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample, onHistory }: {
   </main>;
 }
 
+function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: AuthUser) => void }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(path: string, payload: Record<string, unknown>) {
+    setLoading(true); setError("");
+    try {
+      const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "操作失败，请稍后重试。");
+      onAuthenticated(data.user as AuthUser);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "操作失败，请稍后重试。"); }
+    finally { setLoading(false); }
+  }
+
+  return <main className="auth-page">
+    <section className="auth-story">
+      <div className="product-brand auth-brand"><span>R</span><strong>ROAM</strong><small>AI TRIP PLANNER</small></div>
+      <div><span className="auth-kicker">YOUR JOURNEY, REMEMBERED</span><h1>一份行程，<br/><em>在每台设备继续。</em></h1><p>登录后，生成的路线、每次编辑和 AI 局部重规划都会安全归属于你的账号。</p></div>
+      <div className="auth-benefits"><span>✓ 跨浏览器查看历史</span><span>✓ 修改自动保存版本</span><span>✓ 完整链接仍可分享</span></div>
+    </section>
+    <section className="auth-panel">
+      <div className="auth-card">
+        <div className="auth-tabs"><button className={mode === "login" ? "active" : ""} onClick={() => { setMode("login"); setError(""); }}>登录</button><button className={mode === "register" ? "active" : ""} onClick={() => { setMode("register"); setError(""); }}>注册</button></div>
+        <div className="auth-heading"><small>{mode === "login" ? "欢迎回来" : "创建你的 ROAM 账号"}</small><h2>{mode === "login" ? "继续规划下一段旅程" : "让每次出发都有记录"}</h2></div>
+        {mode === "login" && <div className="test-login-box"><div><span>测试账号已预置</span><strong>ROAM 测试用户</strong><small>无需输入用户名或密码</small></div><button disabled={loading} onClick={() => void submit("/api/auth/login", { mode: "test" })}>{loading ? "正在登录…" : "确定并进入 →"}</button></div>}
+        {mode === "login" && <div className="auth-divider"><span>或使用自己的账号</span></div>}
+        <div className="auth-fields">
+          {mode === "register" && <label><span>显示名称</span><input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="例如：小宇" autoComplete="name"/></label>}
+          <label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="3–32位中文、字母或数字" autoComplete="username"/></label>
+          <label><span>密码</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder={mode === "register" ? "至少8位" : "输入你的密码"} autoComplete={mode === "register" ? "new-password" : "current-password"}/></label>
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <button className="auth-submit" disabled={loading || !username.trim() || !password} onClick={() => void submit(mode === "login" ? "/api/auth/login" : "/api/auth/register", mode === "login" ? { username, password } : { username, displayName, password })}>{loading ? "请稍候…" : mode === "login" ? "登录账号" : "注册并登录"}</button>
+        <p className="auth-note">测试模式下可使用共享测试账号；正式用户的行程按账号隔离。</p>
+      </div>
+    </section>
+  </main>;
+}
+
 function HistoryModal({ open, loading, error, trips, onClose, onOpen }: {
   open: boolean;
   loading: boolean;
@@ -286,7 +333,7 @@ function HistoryModal({ open, loading, error, trips, onClose, onOpen }: {
   return <div className="editor-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="trip-editor history-panel" role="dialog" aria-modal="true" aria-label="历史行程">
       <div className="editor-head"><div><small>ROAM 行程档案</small><h2>历史行程</h2></div><button onClick={onClose} aria-label="关闭历史行程">×</button></div>
-      <p className="history-intro">生成和编辑后的最新版本都保存在数据库中。此列表只显示当前浏览器创建的行程。</p>
+      <p className="history-intro">生成和编辑后的最新版本都保存在数据库中。此列表只显示当前登录账号的行程。</p>
       {loading && <div className="history-state"><i className="spinner"/> 正在读取行程...</div>}
       {error && <div className="form-error" role="alert">{error}</div>}
       {!loading && !error && trips.length === 0 && <div className="history-empty"><b>还没有保存的行程</b><span>完成第一次 AI 规划后，它会出现在这里。</span></div>}
@@ -300,6 +347,8 @@ function HistoryModal({ open, loading, error, trips, onClose, onOpen }: {
 }
 
 export default function Home() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [view, setView] = useState<"planner" | "result">("planner");
   const [form, setForm] = useState<PlannerInput>(emptyInput);
   const [lastInput, setLastInput] = useState<PlannerInput>(emptyInput);
@@ -319,6 +368,7 @@ export default function Home() {
   const [historyTrips, setHistoryTrips] = useState<HistoryItem[]>([]);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const restoredLinkRef = useRef(false);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("madrid-trip-done");
@@ -327,11 +377,20 @@ export default function Home() {
     const date = new Date().getDate();
     if (date >= 15 && date <= 19 && samplePlans.some((p) => p.id === key)) setActive(key);
 
+    void fetch("/api/auth/session", { cache: "no-store" }).then(async (response) => {
+      const data = await readJsonResponse(response);
+      setAuthUser(response.ok ? data.user as AuthUser : null);
+    }).catch(() => setAuthUser(null)).finally(() => setAuthLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (!authUser || authLoading || restoredLinkRef.current) return;
+    restoredLinkRef.current = true;
     const params = new URLSearchParams(window.location.search);
     const savedTripId = params.get("trip");
     const keyToken = params.get("key");
     if (savedTripId) void loadTrip(savedTripId, keyToken ?? "");
-  }, []);
+  }, [authLoading, authUser]);
 
   const plans = trip.days;
   const current = useMemo(() => plans.find((p) => p.id === active) ?? plans[0], [active, plans]);
@@ -399,7 +458,7 @@ export default function Home() {
   async function openHistory() {
     setHistoryOpen(true); setHistoryLoading(true); setHistoryError("");
     try {
-      const response = await fetch(`/api/trips?clientId=${encodeURIComponent(getClientId())}`, { cache: "no-store" });
+      const response = await fetch("/api/trips", { cache: "no-store" });
       const data = await readJsonResponse(response);
       if (!response.ok) throw new Error(data.error || "无法读取历史行程。");
       setHistoryTrips((data.trips as Array<Record<string, unknown>>).map((item) => ({
@@ -409,6 +468,11 @@ export default function Home() {
       })));
     } catch (error) { setHistoryError(error instanceof Error ? error.message : "无法读取历史行程。"); }
     finally { setHistoryLoading(false); }
+  }
+  async function logout() {
+    await fetch("/api/auth/session", { method: "DELETE" }).catch(() => undefined);
+    setAuthUser(null); setHistoryOpen(false); setView("planner"); setTripId(""); setAccessToken("");
+    restoredLinkRef.current = false;
   }
   function openEdit(index: number) { setDraftStop(structuredClone(current.stops[index])); setEditorError(""); setEditor({ kind: "edit", index }); }
   function openInsert(index: number) {
@@ -455,7 +519,9 @@ export default function Home() {
 
   const historyModal = <HistoryModal open={historyOpen} loading={historyLoading} error={historyError} trips={historyTrips} onClose={() => setHistoryOpen(false)} onOpen={(item) => void loadTrip(item.tripId, item.accessToken)}/>;
 
-  if (view === "planner") return <><PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample} onHistory={() => void openHistory()}/>{historyModal}</>;
+  if (authLoading) return <main className="auth-loading"><div className="product-brand"><span>R</span><strong>ROAM</strong></div><i className="spinner dark"/><p>正在连接你的行程档案...</p></main>;
+  if (!authUser) return <AuthScreen onAuthenticated={(user) => { restoredLinkRef.current = false; setAuthUser(user); }}/>;
+  if (view === "planner") return <><PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample} onHistory={() => void openHistory()} user={authUser} onLogout={() => void logout()}/>{historyModal}</>;
 
   return (
     <main>
@@ -463,7 +529,7 @@ export default function Home() {
         <div className="hero-art" aria-hidden="true"><span className="sun"/><span className="route-line one"/><span className="route-line two"/><span className="pin">{trip.destination.slice(0, 1)}</span></div>
         <nav className="topbar">
           <div className="brand"><span>R</span> ROAM · {trip.destination.toUpperCase()}</div>
-          <div className="result-nav"><button onClick={() => void openHistory()}>历史行程</button><button onClick={startNewPlan}>＋ 新建行程</button><div className="trip-dates">{trip.dateLabel}</div></div>
+          <div className="result-nav"><span className="result-user">{authUser.displayName}</span><button onClick={() => void openHistory()}>历史行程</button><button onClick={startNewPlan}>＋ 新建行程</button><button onClick={() => void logout()}>退出</button><div className="trip-dates">{trip.dateLabel}</div></div>
         </nav>
         <div className="hero-copy">
           <div className="eyebrow">{lastInput.tripMode === "work" ? "出差中的城市漫游" : "属于你的城市假期"}</div>

@@ -1,6 +1,7 @@
 import "server-only";
 
 import { Pool, type PoolClient } from "pg";
+import { hashPassword } from "./password";
 
 export type JobStatus = "pending" | "running" | "finished" | "failed";
 
@@ -12,6 +13,7 @@ export type PlanJobRow = {
   result_json: unknown;
   response_status: number | null;
   trip_id: string | null;
+  user_id: string | null;
   attempts: number;
   error_message: string | null;
   started_at: Date | null;
@@ -24,6 +26,7 @@ export type TripRow = {
   id: string;
   access_token: string;
   client_id: string;
+  user_id: string | null;
   destination: string;
   start_date: string;
   end_date: string;
@@ -31,6 +34,16 @@ export type TripRow = {
   plan_json: Record<string, unknown>;
   backend: string;
   current_version: number;
+  created_at: Date;
+  updated_at: Date;
+};
+
+export type UserRow = {
+  id: string;
+  username: string;
+  display_name: string;
+  password_hash: string;
+  is_test: boolean;
   created_at: Date;
   updated_at: Date;
 };
@@ -64,9 +77,29 @@ function getPool() {
 async function initializeSchema() {
   const client = await getPool().connect();
   try {
-    await client.query("SELECT pg_advisory_lock(hashtext('roam-schema-v1'))");
+    await client.query("SELECT pg_advisory_lock(hashtext('roam-schema-v2'))");
     await client.query(`
       CREATE SCHEMA IF NOT EXISTS roam;
+
+      CREATE TABLE IF NOT EXISTS roam.users (
+        id uuid PRIMARY KEY,
+        username text NOT NULL,
+        display_name text NOT NULL,
+        password_hash text NOT NULL,
+        is_test boolean NOT NULL DEFAULT false,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON roam.users(lower(username));
+
+      CREATE TABLE IF NOT EXISTS roam.auth_sessions (
+        id uuid PRIMARY KEY,
+        user_id uuid NOT NULL REFERENCES roam.users(id) ON DELETE CASCADE,
+        token_hash text NOT NULL UNIQUE,
+        expires_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        last_seen_at timestamptz NOT NULL DEFAULT now()
+      );
 
       CREATE TABLE IF NOT EXISTS roam.trip_plans (
         id uuid PRIMARY KEY,
@@ -129,9 +162,34 @@ async function initializeSchema() {
       CREATE INDEX IF NOT EXISTS event_logs_job_idx ON roam.event_logs(job_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS event_logs_trip_idx ON roam.event_logs(trip_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS event_logs_created_idx ON roam.event_logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON roam.auth_sessions(user_id, expires_at DESC);
+
+      ALTER TABLE roam.trip_plans ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES roam.users(id) ON DELETE SET NULL;
+      ALTER TABLE roam.plan_jobs ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES roam.users(id) ON DELETE SET NULL;
+      ALTER TABLE roam.event_logs ADD COLUMN IF NOT EXISTS user_id uuid REFERENCES roam.users(id) ON DELETE SET NULL;
+      CREATE INDEX IF NOT EXISTS trip_plans_user_updated_idx ON roam.trip_plans(user_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS plan_jobs_user_created_idx ON roam.plan_jobs(user_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS event_logs_user_created_idx ON roam.event_logs(user_id, created_at DESC);
     `);
+
+    const testUsername = (process.env.TEST_USER_NAME?.trim() || "roam-test").toLowerCase();
+    const testDisplayName = process.env.TEST_USER_DISPLAY_NAME?.trim() || "ROAM 测试用户";
+    const existing = await client.query<UserRow>("SELECT * FROM roam.users WHERE lower(username) = lower($1)", [testUsername]);
+    let testUser = existing.rows[0];
+    if (!testUser) {
+      const passwordHash = await hashPassword(process.env.TEST_USER_PASSWORD || "roam-test-2026");
+      const inserted = await client.query<UserRow>(
+        `INSERT INTO roam.users(id, username, display_name, password_hash, is_test)
+         VALUES ($1, $2, $3, $4, true) RETURNING *`,
+        [crypto.randomUUID(), testUsername, testDisplayName, passwordHash],
+      );
+      testUser = inserted.rows[0];
+    }
+    await client.query("UPDATE roam.trip_plans SET user_id = $1 WHERE user_id IS NULL", [testUser.id]);
+    await client.query("UPDATE roam.plan_jobs SET user_id = $1 WHERE user_id IS NULL", [testUser.id]);
+    await client.query("DELETE FROM roam.auth_sessions WHERE expires_at < now()");
   } finally {
-    await client.query("SELECT pg_advisory_unlock(hashtext('roam-schema-v1'))").catch(() => undefined);
+    await client.query("SELECT pg_advisory_unlock(hashtext('roam-schema-v2'))").catch(() => undefined);
     client.release();
   }
 }
@@ -157,22 +215,23 @@ export async function logEvent(input: {
   message: string;
   jobId?: string | null;
   tripId?: string | null;
+  userId?: string | null;
   metadata?: Record<string, unknown>;
 }) {
   const pool = await ensureDatabase();
   await pool.query(
-    `INSERT INTO roam.event_logs(level, event, message, job_id, trip_id, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-    [input.level ?? "info", input.event.slice(0, 120), input.message.slice(0, 1000), input.jobId ?? null, input.tripId ?? null, JSON.stringify(input.metadata ?? {})],
+    `INSERT INTO roam.event_logs(level, event, message, job_id, trip_id, user_id, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+    [input.level ?? "info", input.event.slice(0, 120), input.message.slice(0, 1000), input.jobId ?? null, input.tripId ?? null, input.userId ?? null, JSON.stringify(input.metadata ?? {})],
   );
 }
 
-export async function createJob(id: string, request: Record<string, unknown>) {
+export async function createJob(id: string, request: Record<string, unknown>, userId: string) {
   const pool = await ensureDatabase();
   const jobType = request.action === "replan-day" ? "replan" : "generate";
   await pool.query(
-    `INSERT INTO roam.plan_jobs(id, job_type, status, request_json) VALUES ($1, $2, 'pending', $3::jsonb)`,
-    [id, jobType, JSON.stringify(request)],
+    `INSERT INTO roam.plan_jobs(id, job_type, status, request_json, user_id) VALUES ($1, $2, 'pending', $3::jsonb, $4)`,
+    [id, jobType, JSON.stringify(request), userId],
   );
   return jobType;
 }
@@ -244,6 +303,7 @@ export async function createTrip(input: {
   id: string;
   accessToken: string;
   clientId: string;
+  userId: string;
   request: Record<string, unknown>;
   plan: Record<string, unknown>;
   backend: string;
@@ -254,10 +314,10 @@ export async function createTrip(input: {
   return inTransaction(async (client) => {
     const result = await client.query<TripRow>(
       `INSERT INTO roam.trip_plans
-       (id, access_token, client_id, destination, start_date, end_date, input_json, plan_json, backend)
-       VALUES ($1, $2, $3, $4, $5::date, $6::date, $7::jsonb, $8::jsonb, $9)
+       (id, access_token, client_id, user_id, destination, start_date, end_date, input_json, plan_json, backend)
+       VALUES ($1, $2, $3, $4, $5, $6::date, $7::date, $8::jsonb, $9::jsonb, $10)
        RETURNING *`,
-      [input.id, input.accessToken, input.clientId, destination, startDate, endDate, JSON.stringify(input.request), JSON.stringify(input.plan), input.backend],
+      [input.id, input.accessToken, input.clientId, input.userId, destination, startDate, endDate, JSON.stringify(input.request), JSON.stringify(input.plan), input.backend],
     );
     await client.query(
       `INSERT INTO roam.trip_plan_versions(trip_id, version, change_type, plan_json)
@@ -272,6 +332,7 @@ export async function updateTrip(input: {
   tripId: string;
   accessToken?: string;
   clientId?: string;
+  userId?: string;
   plan: Record<string, unknown>;
   changeType: "replan" | "manual_edit";
   instruction?: string;
@@ -279,10 +340,10 @@ export async function updateTrip(input: {
   return inTransaction(async (client) => {
     const result = await client.query<TripRow>(
       `UPDATE roam.trip_plans
-         SET plan_json = $4::jsonb, current_version = current_version + 1, updated_at = now()
-       WHERE id = $1 AND (($2::uuid IS NOT NULL AND access_token = $2::uuid) OR ($3::uuid IS NOT NULL AND client_id = $3::uuid))
+         SET plan_json = $5::jsonb, current_version = current_version + 1, updated_at = now()
+       WHERE id = $1 AND (($2::uuid IS NOT NULL AND access_token = $2::uuid) OR ($3::uuid IS NOT NULL AND client_id = $3::uuid) OR ($4::uuid IS NOT NULL AND user_id = $4::uuid))
        RETURNING *`,
-      [input.tripId, input.accessToken || null, input.clientId || null, JSON.stringify(input.plan)],
+      [input.tripId, input.accessToken || null, input.clientId || null, input.userId || null, JSON.stringify(input.plan)],
     );
     const trip = result.rows[0];
     if (!trip) return null;
@@ -295,21 +356,62 @@ export async function updateTrip(input: {
   });
 }
 
-export async function getTrip(id: string, accessToken?: string, clientId?: string) {
+export async function getTrip(id: string, accessToken?: string, clientId?: string, userId?: string) {
   const pool = await ensureDatabase();
   const result = await pool.query<TripRow>(
     `SELECT * FROM roam.trip_plans
-     WHERE id = $1 AND (($2::uuid IS NOT NULL AND access_token = $2::uuid) OR ($3::uuid IS NOT NULL AND client_id = $3::uuid))`,
-    [id, accessToken || null, clientId || null],
+     WHERE id = $1 AND (($2::uuid IS NOT NULL AND access_token = $2::uuid) OR ($3::uuid IS NOT NULL AND client_id = $3::uuid) OR ($4::uuid IS NOT NULL AND user_id = $4::uuid))`,
+    [id, accessToken || null, clientId || null, userId || null],
   );
   return result.rows[0] ?? null;
 }
 
-export async function listTrips(clientId: string, limit = 30) {
+export async function listTrips(userId: string, limit = 30) {
   const pool = await ensureDatabase();
   const result = await pool.query<TripRow>(
-    `SELECT * FROM roam.trip_plans WHERE client_id = $1 ORDER BY updated_at DESC LIMIT $2`,
-    [clientId, Math.min(Math.max(limit, 1), 50)],
+    `SELECT * FROM roam.trip_plans WHERE user_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+    [userId, Math.min(Math.max(limit, 1), 50)],
   );
   return result.rows;
+}
+
+export async function findUserByUsername(username: string) {
+  const pool = await ensureDatabase();
+  const result = await pool.query<UserRow>("SELECT * FROM roam.users WHERE lower(username) = lower($1)", [username]);
+  return result.rows[0] ?? null;
+}
+
+export async function createUser(input: { username: string; displayName: string; passwordHash: string }) {
+  const pool = await ensureDatabase();
+  const result = await pool.query<UserRow>(
+    `INSERT INTO roam.users(id, username, display_name, password_hash)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    [crypto.randomUUID(), input.username, input.displayName, input.passwordHash],
+  );
+  return result.rows[0];
+}
+
+export async function createAuthSession(input: { id: string; userId: string; tokenHash: string; expiresAt: Date }) {
+  const pool = await ensureDatabase();
+  await pool.query(
+    `INSERT INTO roam.auth_sessions(id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+    [input.id, input.userId, input.tokenHash, input.expiresAt],
+  );
+}
+
+export async function findUserBySession(tokenHash: string) {
+  const pool = await ensureDatabase();
+  const result = await pool.query<UserRow>(
+    `UPDATE roam.auth_sessions s SET last_seen_at = now()
+     FROM roam.users u
+     WHERE s.token_hash = $1 AND s.expires_at > now() AND u.id = s.user_id
+     RETURNING u.*`,
+    [tokenHash],
+  );
+  return result.rows[0] ?? null;
+}
+
+export async function deleteAuthSession(tokenHash: string) {
+  const pool = await ensureDatabase();
+  await pool.query("DELETE FROM roam.auth_sessions WHERE token_hash = $1", [tokenHash]);
 }

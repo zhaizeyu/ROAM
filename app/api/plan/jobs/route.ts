@@ -10,6 +10,7 @@ import {
   resetStaleJob,
   updateTrip,
 } from "../../../../lib/db";
+import { getAuthenticatedUser } from "../../../../lib/auth";
 import { POST as runPlan } from "../route";
 
 export const runtime = "nodejs";
@@ -27,9 +28,13 @@ async function runJob(jobId: string, requestUrl: string) {
   if (activeRuns.has(jobId)) return;
   const job = await claimJob(jobId);
   if (!job) return;
+  if (!job.user_id) {
+    await finishJob(jobId, 401, { error: "登录状态已失效，请重新登录。" });
+    return;
+  }
   activeRuns.add(jobId);
   const startedAt = Date.now();
-  await logEvent({ event: "plan_job_started", message: "规划任务开始执行", jobId, metadata: { jobType: job.job_type, attempt: job.attempts } });
+  await logEvent({ event: "plan_job_started", message: "规划任务开始执行", jobId, userId: job.user_id, metadata: { jobType: job.job_type, attempt: job.attempts } });
 
   try {
     const innerRequest = new Request(new URL("/api/plan", requestUrl), {
@@ -60,6 +65,7 @@ async function runJob(jobId: string, requestUrl: string) {
           id: tripId,
           accessToken,
           clientId,
+          userId: job.user_id,
           request: job.request_json,
           plan: payload.plan as Record<string, unknown>,
           backend: typeof payload.backend === "string" ? payload.backend : payload.demo ? "demo" : "unknown",
@@ -73,6 +79,7 @@ async function runJob(jobId: string, requestUrl: string) {
               tripId: requestedTripId,
               accessToken,
               clientId,
+              userId: job.user_id,
               plan: payload.plan as Record<string, unknown>,
               changeType: "replan",
               instruction: typeof job.request_json.instruction === "string" ? job.request_json.instruction : undefined,
@@ -91,13 +98,14 @@ async function runJob(jobId: string, requestUrl: string) {
       message: response.ok ? "规划任务执行成功" : "规划服务返回错误",
       jobId,
       tripId,
+      userId: job.user_id,
       metadata: { responseStatus: response.status, durationMs: Date.now() - startedAt, backend: payload.backend ?? null },
     });
   } catch (error) {
     const message = errorMessage(error);
     const payload = { error: message };
     await finishJob(jobId, 500, payload).catch(() => undefined);
-    await logEvent({ level: "error", event: "plan_job_failed", message, jobId, metadata: { durationMs: Date.now() - startedAt } }).catch(() => undefined);
+    await logEvent({ level: "error", event: "plan_job_failed", message, jobId, userId: job.user_id, metadata: { durationMs: Date.now() - startedAt } }).catch(() => undefined);
     console.error("[plan_job_failed]", jobId, message);
   } finally {
     activeRuns.delete(jobId);
@@ -106,6 +114,8 @@ async function runJob(jobId: string, requestUrl: string) {
 
 export async function POST(request: Request) {
   try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return NextResponse.json({ error: "请先登录后再生成行程。" }, { status: 401, headers: noStore });
     if (await activeJobCount() >= 50) {
       return NextResponse.json({ error: "当前规划任务较多，请稍后再试。" }, { status: 429, headers: noStore });
     }
@@ -116,8 +126,9 @@ export async function POST(request: Request) {
     }
 
     const jobId = crypto.randomUUID();
-    const jobType = await createJob(jobId, body);
-    await logEvent({ event: "plan_job_created", message: "已创建规划任务", jobId, metadata: { jobType } });
+    body.userId = user.id;
+    const jobType = await createJob(jobId, body, user.id);
+    await logEvent({ event: "plan_job_created", message: "已创建规划任务", jobId, userId: user.id, metadata: { jobType } });
     void runJob(jobId, request.url);
     return NextResponse.json({ jobId, status: "working" }, { status: 202, headers: noStore });
   } catch (error) {
@@ -128,13 +139,16 @@ export async function POST(request: Request) {
 
 export async function GET(request: Request) {
   try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) return NextResponse.json({ error: "登录状态已失效，请重新登录。" }, { status: 401, headers: noStore });
     const jobId = new URL(request.url).searchParams.get("id") ?? "";
     if (!uuidPattern.test(jobId)) return NextResponse.json({ error: "规划任务编号无效。" }, { status: 400, headers: noStore });
     let job = await getJob(jobId);
     if (!job) return NextResponse.json({ error: "规划任务不存在，请重新生成。" }, { status: 404, headers: noStore });
+    if (job.user_id !== user.id) return NextResponse.json({ error: "你没有权限读取这个规划任务。" }, { status: 403, headers: noStore });
 
     if (job.status === "running" && await resetStaleJob(jobId)) {
-      await logEvent({ level: "warn", event: "plan_job_recovered", message: "检测到中断任务，准备重新执行", jobId, metadata: { attempts: job.attempts } });
+      await logEvent({ level: "warn", event: "plan_job_recovered", message: "检测到中断任务，准备重新执行", jobId, userId: user.id, metadata: { attempts: job.attempts } });
       job = await getJob(jobId);
     }
     if (job?.status === "pending") void runJob(jobId, request.url);
