@@ -38,7 +38,7 @@ OPENAI_MODEL=中转站中实际存在的模型ID
 
 ## 部署
 
-可部署到 Vercel 或任何支持 Next.js Node 运行时的平台，并在部署平台中设置上述环境变量。Google Maps 链接本身不需要 Maps JavaScript API 密钥；只有未来把可交互地图直接嵌进页面时，才需要单独申请 Google Maps Platform key，并配置域名限制和账单。
+可部署到 Vercel 或任何支持 Next.js Node 运行时的平台，并在部署平台中设置上述环境变量。生产环境还需要 PostgreSQL；Google Maps 链接本身不需要 Maps JavaScript API 密钥，只有未来把可交互地图直接嵌进页面时才需要单独申请 Google Maps Platform key。
 
 ## 部署到 Coolify
 
@@ -55,10 +55,12 @@ OPENAI_MODEL=中转站中实际存在的模型ID
 OPENAI_API_KEY=你的服务端密钥
 OPENAI_MODEL=gpt-5.4-mini
 OPENAI_BASE_URL=https://你的-new-api-域名/v1
+DATABASE_URL=postgres://用户名:密码@数据库地址:5432/数据库名
+DATABASE_SSL=false
 NODE_ENV=production
 ```
 
-`OPENAI_API_KEY` 只需勾选 **Runtime Variable**，关闭 **Build Variable**，避免密钥进入镜像构建信息。无需在 Coolify 环境变量中配置 `PORT` 或 `HOSTNAME`，也无需把容器端口映射到宿主机。
+`OPENAI_API_KEY` 和 `DATABASE_URL` 只需勾选 **Runtime Variable**，关闭 **Build Variable**，避免密钥进入镜像构建信息。无需在 Coolify 环境变量中配置 `PORT` 或 `HOSTNAME`，也无需把容器端口映射到宿主机。程序首次访问数据库时会自动创建独立的 `roam` schema，不会改动 `public` schema 中的其他项目表。
 
 健康检查已经写入 Dockerfile：
 
@@ -87,7 +89,7 @@ curl https://你的域名/api/health
 - Minimum Replicas：MVP 保持 `1` 即可。
 - Build Cache：保持开启，不要启用 Include Source Commit，避免每次提交使整个镜像缓存失效。
 - API 密钥：仅 Runtime Variable；不要添加 `NEXT_PUBLIC_` 前缀。
-- 持久卷：当前项目不需要数据库或本地文件持久化，因此无需挂载 Volume。
+- 持久卷：ROAM 容器本身无需 Volume；行程、版本、任务与诊断日志保存在 PostgreSQL。
 
 ## 推荐生产架构：使用 Hermes Agent
 
@@ -190,20 +192,21 @@ AI_REQUEST_TIMEOUT_MS=180000
 
 MVP 阶段 Hermes 保持单副本。更新镜像前先备份 `/opt/data`，验证稳定后建议把 `latest` 固定到已测试的版本标签，避免上游更新改变工具或配置行为。
 
-## 当前数据是否持久化
+## PostgreSQL 持久化
 
-当前是一次性规划模式，没有数据库，也没有把生成结果写入容器磁盘：
+应用使用 `roam` schema 隔离自己的数据：
 
-- 生成后的行程只保存在当前浏览器页面的 React 内存中。
-- 用户刷新或关闭页面后，刚生成的行程就会消失；不需要等到容器重启。
-- 容器重启不会影响任何共享数据，因为服务端本来就没有保存行程。
-- 行程站点的“完成”勾选单独保存在该浏览器的 `localStorage`；同一浏览器刷新后通常仍保留，清理站点数据或换设备后会消失。
-- 内置马德里示例写在代码里，重新部署后仍然存在。
+- `trip_plans` 保存当前行程和永久访问令牌；生成后地址栏会得到可恢复的行程链接。
+- `trip_plan_versions` 保存初次生成、手工编辑和 AI 局部重规划的每个版本。
+- `plan_jobs` 保存后台生成任务与返回结果，成功结果不会因 ROAM 容器重启而丢失；中断任务可在超时后自动重试。
+- `event_logs` 保存任务开始、完成、失败和手工编辑等结构化诊断事件，不记录 LLM 或数据库密钥。
 
-如果下一阶段需要“分享链接、跨设备继续、历史行程”，再接 PostgreSQL 即可；当前 MVP 无需数据库和 Volume。
+“历史行程”按浏览器本地生成的匿名 ID 隔离；永久链接额外使用随机访问令牌，因此复制完整链接可在其他设备继续查看。当前没有账户系统，拿到完整链接的人等同于获得该行程的访问权限。
+
+行程站点的“完成”勾选仍只保存在浏览器 `localStorage`，它是个人进度而不是行程内容。内置马德里示例不会写入数据库。
 
 ## MVP 边界
 
-- 当前包含生成、展示、路线跳转、官方购票链接字段和本地完成进度。
-- 生产化前建议增加登录、数据库保存、限流、用量计费、计划分享和人工反馈。
+- 当前包含生成、持久链接、历史行程、版本记录、手工编辑、AI 局部重规划、路线跳转和官方购票链接字段。
+- 生产化前建议增加登录、数据库备份与保留策略、按用户限流、用量计费和人工反馈。
 - 中国大陆用户能否直接打开 Google Maps 取决于其网络环境；后续可按用户地区增加高德、百度或 Apple Maps 路线适配层。

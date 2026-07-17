@@ -22,6 +22,8 @@ type DayPlan = {
   stops: Stop[];
 };
 type TripResult = { destination: string; subtitle: string; base: string; dateLabel: string; notice: string; days: DayPlan[] };
+type TripPersistence = { tripId: string; accessToken: string; version?: number };
+type HistoryItem = TripPersistence & { destination: string; startDate: string; endDate: string; subtitle: string; version: number; updatedAt: string };
 type PlannerInput = {
   destination: string; base: string; startDate: string; endDate: string; tripMode: "work" | "leisure";
   weekdayWindow: string; weekendWindow: string; pace: string; interests: string[]; mustDo: string; constraints: string;
@@ -152,8 +154,16 @@ async function readJsonResponse(response: Response) {
   }
 }
 
+function getClientId() {
+  const key = "roam-client-id";
+  let value = window.localStorage.getItem(key);
+  if (!value) { value = crypto.randomUUID(); window.localStorage.setItem(key, value); }
+  return value;
+}
+
 async function requestPlan(payload: unknown, signal?: AbortSignal) {
-  const started = await fetch("/api/plan/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), signal });
+  const requestPayload = payload && typeof payload === "object" && !Array.isArray(payload) ? { ...payload, clientId: getClientId() } : payload;
+  const started = await fetch("/api/plan/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestPayload), signal });
   const startData = await readJsonResponse(started);
   if (!started.ok) throw new Error(startData.error || "无法启动规划任务，请稍后重试。");
   const jobId = startData.jobId;
@@ -171,11 +181,12 @@ async function requestPlan(payload: unknown, signal?: AbortSignal) {
   throw new Error("本次规划耗时过长，请缩短日期范围后重试。");
 }
 
-function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
+function PlannerHome({ form, onFormChange, onGenerated, onSample, onHistory }: {
   form: PlannerInput;
   onFormChange: (next: PlannerInput) => void;
-  onGenerated: (plan: TripResult, input: PlannerInput) => void;
+  onGenerated: (plan: TripResult, input: PlannerInput, persistence: TripPersistence) => void;
   onSample: () => void;
+  onHistory: () => void;
 }) {
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -198,7 +209,7 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
     const payload = { ...form, weekdayWindow: form.tripMode === "leisure" ? "" : form.weekdayWindow };
     try {
       const data = await requestPlan(payload, controller.signal);
-      onGenerated(data.plan, form);
+      onGenerated(data.plan, form, { tripId: data.tripId, accessToken: data.accessToken, version: data.version });
     } catch (reason) {
       setError(reason instanceof DOMException && reason.name === "AbortError" ? "已取消本次生成，你可以修改需求后重新开始。" : reason instanceof Error ? reason.message : "生成失败，请稍后重试。");
     } finally { controllerRef.current = null; setLoading(false); }
@@ -209,7 +220,7 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
   return <main className="planner-page">
     <nav className="product-nav">
       <div className="product-brand"><span>R</span><strong>ROAM</strong><small>AI TRIP PLANNER</small></div>
-      <button onClick={onSample}>查看马德里示例 <span>↗</span></button>
+      <div className="planner-nav-actions"><button onClick={onHistory}>历史行程</button><button onClick={onSample}>马德里示例 <span>↗</span></button></div>
     </nav>
     <section className="planner-hero">
       <div className="planner-intro">
@@ -263,6 +274,31 @@ function PlannerHome({ form, onFormChange, onGenerated, onSample }: {
   </main>;
 }
 
+function HistoryModal({ open, loading, error, trips, onClose, onOpen }: {
+  open: boolean;
+  loading: boolean;
+  error: string;
+  trips: HistoryItem[];
+  onClose: () => void;
+  onOpen: (trip: HistoryItem) => void;
+}) {
+  if (!open) return null;
+  return <div className="editor-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="trip-editor history-panel" role="dialog" aria-modal="true" aria-label="历史行程">
+      <div className="editor-head"><div><small>ROAM 行程档案</small><h2>历史行程</h2></div><button onClick={onClose} aria-label="关闭历史行程">×</button></div>
+      <p className="history-intro">生成和编辑后的最新版本都保存在数据库中。此列表只显示当前浏览器创建的行程。</p>
+      {loading && <div className="history-state"><i className="spinner"/> 正在读取行程...</div>}
+      {error && <div className="form-error" role="alert">{error}</div>}
+      {!loading && !error && trips.length === 0 && <div className="history-empty"><b>还没有保存的行程</b><span>完成第一次 AI 规划后，它会出现在这里。</span></div>}
+      <div className="history-list">{trips.map((item) => <button key={item.tripId} onClick={() => onOpen(item)}>
+        <span className="history-place">{item.destination.slice(0, 1)}</span>
+        <div><strong>{item.destination}</strong><small>{item.startDate} — {item.endDate}</small><p>{item.subtitle}</p></div>
+        <span className="history-version">V{item.version}<small>{new Date(item.updatedAt).toLocaleDateString("zh-CN")}</small></span>
+      </button>)}</div>
+    </section>
+  </div>;
+}
+
 export default function Home() {
   const [view, setView] = useState<"planner" | "result">("planner");
   const [form, setForm] = useState<PlannerInput>(emptyInput);
@@ -275,6 +311,14 @@ export default function Home() {
   const [aiInstruction, setAiInstruction] = useState("");
   const [editorLoading, setEditorLoading] = useState(false);
   const [editorError, setEditorError] = useState("");
+  const [tripId, setTripId] = useState("");
+  const [accessToken, setAccessToken] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [historyTrips, setHistoryTrips] = useState<HistoryItem[]>([]);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     const saved = window.localStorage.getItem("madrid-trip-done");
@@ -282,6 +326,11 @@ export default function Home() {
     const key = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][new Date().getDay()];
     const date = new Date().getDate();
     if (date >= 15 && date <= 19 && samplePlans.some((p) => p.id === key)) setActive(key);
+
+    const params = new URLSearchParams(window.location.search);
+    const savedTripId = params.get("trip");
+    const keyToken = params.get("key");
+    if (savedTripId) void loadTrip(savedTripId, keyToken ?? "");
   }, []);
 
   const plans = trip.days;
@@ -295,16 +344,71 @@ export default function Home() {
     window.localStorage.setItem(`roam-trip-done:${trip.destination}:${trip.dateLabel}`, JSON.stringify(next));
   }
 
-  function showPlan(plan: TripResult, input: PlannerInput) { setTrip(plan); setLastInput(input); setActive(plan.days[0].id); setDone({}); setView("result"); window.scrollTo({ top: 0 }); }
+  function setPermanentLink(id: string, token: string) {
+    const url = new URL(window.location.href);
+    if (id && token) { url.searchParams.set("trip", id); url.searchParams.set("key", token); }
+    else { url.searchParams.delete("trip"); url.searchParams.delete("key"); }
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  }
+  function showPlan(plan: TripResult, input: PlannerInput, persistence?: TripPersistence) {
+    setTrip(plan); setLastInput(input); setActive(plan.days[0].id); setDone({}); setView("result"); setSaveState(persistence ? "saved" : "idle");
+    setTripId(persistence?.tripId ?? ""); setAccessToken(persistence?.accessToken ?? "");
+    if (persistence) setPermanentLink(persistence.tripId, persistence.accessToken); else setPermanentLink("", "");
+    window.scrollTo({ top: 0 });
+  }
   function showSample() {
     setForm(sampleInput);
     showPlan({ destination: "马德里", subtitle: "5天 · 2个重点景点 · 1场世界杯决赛", base: hotel, dateLabel: "15—19 JUL · 2026", notice: "L10施工提醒：Plaza de Castilla—Nuevos Ministerios停运。市中心方向在 Plaza de Castilla 换L1。", days: samplePlans }, sampleInput);
   }
-  function startNewPlan() { setForm(emptyInput); setLastInput(emptyInput); setView("planner"); window.scrollTo({ top: 0 }); }
+  function startNewPlan() { setForm(emptyInput); setLastInput(emptyInput); setTripId(""); setAccessToken(""); setPermanentLink("", ""); setView("planner"); window.scrollTo({ top: 0 }); }
   function editPlan() { setForm(lastInput); setView("planner"); window.scrollTo({ top: 0 }); }
-  function updateCurrentDay(nextDay: DayPlan) {
-    setTrip((currentTrip) => ({ ...currentTrip, days: currentTrip.days.map((day) => day.id === nextDay.id ? nextDay : day) }));
+  function persistManual(nextTrip: TripResult, instruction: string) {
+    if (!tripId || !accessToken) return;
+    setSaveState("saving");
+    saveQueueRef.current = saveQueueRef.current.then(async () => {
+      const response = await fetch(`/api/trips/${encodeURIComponent(tripId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ accessToken, clientId: getClientId(), plan: nextTrip, instruction }),
+      });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "保存修改失败。");
+      setSaveState("saved");
+    }).catch((error) => { console.error(error); setSaveState("error"); });
+  }
+  function updateCurrentDay(nextDay: DayPlan, instruction = "网页手工编辑当天行程") {
+    const nextTrip = { ...trip, days: trip.days.map((day) => day.id === nextDay.id ? nextDay : day) };
+    setTrip(nextTrip);
+    persistManual(nextTrip, instruction);
     setDone({});
+  }
+  async function loadTrip(id: string, token: string) {
+    try {
+      setHistoryLoading(true); setHistoryError("");
+      const query = new URLSearchParams({ clientId: getClientId() });
+      if (token) query.set("key", token);
+      const response = await fetch(`/api/trips/${encodeURIComponent(id)}?${query}`, { cache: "no-store" });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "无法打开这份行程。");
+      const input = data.input as PlannerInput;
+      showPlan(data.plan as TripResult, input, { tripId: data.tripId, accessToken: data.accessToken, version: data.version });
+      setHistoryOpen(false);
+    } catch (error) { setHistoryError(error instanceof Error ? error.message : "无法打开这份行程。"); if (!historyOpen) setHistoryOpen(true); }
+    finally { setHistoryLoading(false); }
+  }
+  async function openHistory() {
+    setHistoryOpen(true); setHistoryLoading(true); setHistoryError("");
+    try {
+      const response = await fetch(`/api/trips?clientId=${encodeURIComponent(getClientId())}`, { cache: "no-store" });
+      const data = await readJsonResponse(response);
+      if (!response.ok) throw new Error(data.error || "无法读取历史行程。");
+      setHistoryTrips((data.trips as Array<Record<string, unknown>>).map((item) => ({
+        tripId: String(item.id), accessToken: String(item.accessToken), destination: String(item.destination),
+        startDate: String(item.startDate).slice(0, 10), endDate: String(item.endDate).slice(0, 10), subtitle: String(item.subtitle),
+        version: Number(item.version), updatedAt: String(item.updatedAt),
+      })));
+    } catch (error) { setHistoryError(error instanceof Error ? error.message : "无法读取历史行程。"); }
+    finally { setHistoryLoading(false); }
   }
   function openEdit(index: number) { setDraftStop(structuredClone(current.stops[index])); setEditorError(""); setEditor({ kind: "edit", index }); }
   function openInsert(index: number) {
@@ -322,18 +426,18 @@ export default function Home() {
     const normalized = { ...draftStop, time: draftStop.time.trim(), title: draftStop.title.trim(), text: draftStop.text.trim(), meta: draftStop.meta?.trim() };
     if (editor.kind === "edit") stops[editor.index] = normalized;
     else stops.splice(editor.index, 0, { ...normalized, links: [{ label: `在地图中查看${normalized.title}`, url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${normalized.title} ${trip.destination}`)}`, kind: "map" }] });
-    updateCurrentDay({ ...current, stops }); closeEditor();
+    updateCurrentDay({ ...current, stops }, editor.kind === "edit" ? `编辑站点：${normalized.title}` : `插入站点：${normalized.title}`); closeEditor();
   }
   function removeStop(index: number) {
     if (current.stops.length <= 2 || !window.confirm(`确定删除“${current.stops[index].title}”吗？`)) return;
-    updateCurrentDay({ ...current, stops: current.stops.filter((_, itemIndex) => itemIndex !== index) });
+    updateCurrentDay({ ...current, stops: current.stops.filter((_, itemIndex) => itemIndex !== index) }, `删除站点：${current.stops[index].title}`);
   }
   function moveStop(index: number, direction: -1 | 1) {
     const target = index + direction;
     if (target < 0 || target >= current.stops.length) return;
     const stops = [...current.stops];
     [stops[index], stops[target]] = [stops[target], stops[index]];
-    updateCurrentDay({ ...current, stops });
+    updateCurrentDay({ ...current, stops }, `调整站点顺序：${current.stops[index].title}`);
   }
   async function replanDay() {
     if (!editor || !aiInstruction.trim() && !(editor.kind === "insert" && draftStop.title.trim())) { setEditorError("请告诉 AI 想怎样调整当天路线。"); return; }
@@ -342,13 +446,16 @@ export default function Home() {
       ? `在第 ${editor.index} 个位置插入“${draftStop.title.trim()}”。期望时间：${draftStop.time.trim() || "由你安排"}。补充说明：${draftStop.text.trim() || "无"}。${aiInstruction.trim()}`
       : aiInstruction.trim();
     try {
-      const data = await requestPlan({ action: "replan-day", input: lastInput, trip, dayId: current.id, instruction });
-      setTrip(data.plan); setDone({}); setEditor(null);
+      if (!tripId || !accessToken) throw new Error("示例行程不能保存 AI 调整，请先生成一份自己的行程。");
+      const data = await requestPlan({ action: "replan-day", input: lastInput, trip, dayId: current.id, instruction, tripId, accessToken });
+      setTrip(data.plan); setTripId(data.tripId); setAccessToken(data.accessToken); setPermanentLink(data.tripId, data.accessToken); setSaveState("saved"); setDone({}); setEditor(null);
     } catch (reason) { setEditorError(reason instanceof Error ? reason.message : "局部重规划失败，请稍后重试。"); }
     finally { setEditorLoading(false); }
   }
 
-  if (view === "planner") return <PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample}/>;
+  const historyModal = <HistoryModal open={historyOpen} loading={historyLoading} error={historyError} trips={historyTrips} onClose={() => setHistoryOpen(false)} onOpen={(item) => void loadTrip(item.tripId, item.accessToken)}/>;
+
+  if (view === "planner") return <><PlannerHome form={form} onFormChange={setForm} onGenerated={showPlan} onSample={showSample} onHistory={() => void openHistory()}/>{historyModal}</>;
 
   return (
     <main>
@@ -356,7 +463,7 @@ export default function Home() {
         <div className="hero-art" aria-hidden="true"><span className="sun"/><span className="route-line one"/><span className="route-line two"/><span className="pin">{trip.destination.slice(0, 1)}</span></div>
         <nav className="topbar">
           <div className="brand"><span>R</span> ROAM · {trip.destination.toUpperCase()}</div>
-          <div className="result-nav"><button onClick={startNewPlan}>＋ 新建行程</button><div className="trip-dates">{trip.dateLabel}</div></div>
+          <div className="result-nav"><button onClick={() => void openHistory()}>历史行程</button><button onClick={startNewPlan}>＋ 新建行程</button><div className="trip-dates">{trip.dateLabel}</div></div>
         </nav>
         <div className="hero-copy">
           <div className="eyebrow">{lastInput.tripMode === "work" ? "出差中的城市漫游" : "属于你的城市假期"}</div>
@@ -373,7 +480,7 @@ export default function Home() {
       <section className="service-alert" aria-label="重要交通提醒">
         <div className="alert-mark">!</div>
         <div><strong>出发前提醒</strong><p>{trip.notice}</p></div>
-        <button className="edit-plan" onClick={editPlan}>编辑需求</button>
+        <div className="save-status" data-state={saveState}>{saveState === "saving" ? "正在保存…" : saveState === "error" ? "保存失败" : tripId ? "✓ 已保存到云端" : "示例行程"}</div><button className="edit-plan" onClick={editPlan}>编辑需求</button>
       </section>
 
       <div className="app-shell">
@@ -430,7 +537,7 @@ export default function Home() {
             <label className="wide"><span>时间 / 体力备注</span><input value={draftStop.meta ?? ""} onChange={(event) => setDraftStop({ ...draftStop, meta: event.target.value })} placeholder="例如 停留约90分钟 · 可坐下休息"/></label>
           </div>}
           {editor.kind !== "edit" && <label className="editor-ai"><span>{editor.kind === "insert" ? "交给 AI 的补充要求（可选）" : "你想怎样修改当天？"}</span><textarea value={aiInstruction} onChange={(event) => setAiInstruction(event.target.value)} placeholder={editor.kind === "insert" ? "例如：插入后仍要保留晚餐，避免跨城折返" : "例如：下午加入塞切尼温泉，减少步行，晚餐安排在20:00前"}/></label>}
-          <div className="editor-note">改动仅保存在当前页面；AI 局部重规划只会替换这一天。</div>
+          <div className="editor-note">修改会自动保存到数据库并生成新版本；AI 局部重规划只会替换这一天。</div>
           {editorError && <div className="form-error" role="alert">{editorError}</div>}
           <div className="editor-actions"><button className="secondary" onClick={closeEditor}>取消</button>{editor.kind !== "replan" && <button className="secondary" onClick={saveStop}>直接保存</button>}{editor.kind !== "edit" && <button className="primary" disabled={editorLoading} onClick={replanDay}>{editorLoading ? <><i className="spinner"/> AI 正在重排当天...</> : <>✦ AI {editor.kind === "insert" ? "插入并优化" : "局部重规划"}</>}</button>}</div>
         </section>
@@ -445,6 +552,8 @@ export default function Home() {
           <div><b>04</b><strong>随时调整</strong><p>天气、闭馆和活动可能变化；临出发前复核，不必勉强完成所有站点。</p></div>
         </div>
       </section>
+
+      {historyModal}
 
       <footer><div className="brand"><span>R</span> ROAM</div><p>旅途可以有重点，也可以有余地。</p><a href="#top" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}>回到顶部 ↑</a></footer>
     </main>
