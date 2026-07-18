@@ -63,7 +63,10 @@ function mapDestination(links: unknown) {
 }
 
 export function imageQueryForStop(stop: Record<string, unknown>, destination: string) {
-  if (typeof stop.imageQuery === "string" && stop.imageQuery.trim()) return stop.imageQuery.trim().slice(0, 180);
+  if (typeof stop.imageQuery === "string" && stop.imageQuery.trim()) {
+    const requested = stop.imageQuery.trim().slice(0, 180);
+    return foodWords.test(`${String(stop.title ?? "")} ${String(stop.text ?? "")}`) ? `${requested} restaurant cuisine` : requested;
+  }
   const mapped = mapDestination(stop.links);
   if (mapped) return `${mapped} ${destination}`.trim();
   const title = typeof stop.title === "string" ? stop.title : "";
@@ -113,7 +116,7 @@ async function searchCommons(query: string): Promise<PlaceImage | null> {
     const payload = await response.json() as { query?: { pages?: CommonsPage[] } };
     const pages = (payload.query?.pages ?? []).filter((page) => {
       const info = page.imageinfo?.[0];
-      return Boolean(info?.thumburl && info.mime?.startsWith("image/") && !/svg|gif/i.test(info.mime));
+      return Boolean(info?.thumburl && /image\/(jpeg|png|webp)/i.test(info.mime ?? "") && !/\.(pdf|djvu|tiff?|svg|gif)$/i.test(page.title ?? ""));
     });
     const page = pages.sort((a, b) => scorePage(b, query) - scorePage(a, query))[0];
     const info = page?.imageinfo?.[0];
