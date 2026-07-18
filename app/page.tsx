@@ -153,14 +153,20 @@ function visualQuery(stop: Stop, destination: string) {
   return `${stop.title} ${category} ${destination}`;
 }
 
+function usablePlaceImage(image: PlaceImage | undefined): image is PlaceImage {
+  return Boolean(image?.url && image.sourceUrl && !/\.(pdf|djvu|tiff?|svg|gif)(?:$|[?#])/i.test(image.sourceUrl));
+}
+
 function StopVisual({ stop, destination }: { stop: Stop; destination: string }) {
-  const [image, setImage] = useState<PlaceImage | null>(stop.image ?? null);
-  const [status, setStatus] = useState<"loading" | "ready" | "empty">(stop.image ? "ready" : "loading");
+  const initialImage = usablePlaceImage(stop.image) ? stop.image : null;
+  const [image, setImage] = useState<PlaceImage | null>(initialImage);
+  const [status, setStatus] = useState<"loading" | "ready" | "empty">(initialImage ? "ready" : "loading");
   const query = useMemo(() => visualQuery(stop, destination), [destination, stop]);
 
   useEffect(() => {
-    setImage(stop.image ?? null);
-    if (stop.image) { setStatus("ready"); return; }
+    const savedImage = usablePlaceImage(stop.image) ? stop.image : null;
+    setImage(savedImage);
+    if (savedImage) { setStatus("ready"); return; }
     const controller = new AbortController();
     setStatus("loading");
     void fetch(`/api/place-image?q=${encodeURIComponent(query)}&v=2`, { signal: controller.signal, cache: "no-store" })

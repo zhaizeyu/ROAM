@@ -182,7 +182,9 @@ export async function enrichPlanImages(plan: Record<string, unknown>) {
   async function worker() {
     while (cursor < stops.length) {
       const stop = stops[cursor++];
-      if (stop.image && typeof stop.image === "object") { matched += 1; continue; }
+      const savedSource = stop.image && typeof stop.image === "object" && typeof (stop.image as { sourceUrl?: unknown }).sourceUrl === "string" ? (stop.image as { sourceUrl: string }).sourceUrl : "";
+      if (savedSource && !/\.(pdf|djvu|tiff?|svg|gif)(?:$|[?#])/i.test(savedSource)) { matched += 1; continue; }
+      delete stop.image;
       const image = await findPlaceImage(imageQueryForStop(stop, destination));
       if (image) { stop.image = image; matched += 1; }
     }
