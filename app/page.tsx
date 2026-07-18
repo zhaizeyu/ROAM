@@ -19,6 +19,7 @@ type Stop = {
   meta?: string;
   links?: LinkItem[];
   accent?: "red" | "gold" | "blue";
+  imageQuery?: string;
   image?: PlaceImage;
 };
 type DayPlan = {
@@ -140,6 +141,7 @@ function TicketIcon() {
 }
 
 function visualQuery(stop: Stop, destination: string) {
+  if (stop.imageQuery?.trim()) return stop.imageQuery.trim();
   for (const link of stop.links ?? []) {
     try {
       const url = new URL(link.url);

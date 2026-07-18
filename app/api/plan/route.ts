@@ -141,13 +141,14 @@ const schema = {
             items: {
               type: "object",
               additionalProperties: false,
-              required: ["time", "title", "text", "meta", "accent", "links"],
+              required: ["time", "title", "text", "meta", "accent", "imageQuery", "links"],
               properties: {
                 time: { type: "string" },
                 title: { type: "string" },
                 text: { type: "string" },
                 meta: { type: "string" },
                 accent: { type: "string", enum: ["red", "gold", "blue"] },
+                imageQuery: { type: "string", description: "用于查找地点实景参考图的简短英文关键词，必须包含具体地点或餐厅的官方名称与城市，例如 Museo del Prado Madrid" },
                 links: {
                   type: "array",
                   maxItems: 3,

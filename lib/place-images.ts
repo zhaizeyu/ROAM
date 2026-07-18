@@ -26,6 +26,14 @@ const apiUrl = "https://commons.wikimedia.org/w/api.php";
 const cache = new Map<string, Promise<PlaceImage | null>>();
 const rejectWords = /\b(flag|logo|icon|map|diagram|seal|coat of arms|poster|banner|sign|portrait|painting|drawing|plan)\b/i;
 const foodWords = /(餐|吃|美食|小吃|酒吧|咖啡|午饭|午餐|晚饭|晚餐|早餐|restaurant|food|bar|cafe|tapas)/i;
+const locationAliases: Array<[RegExp, string]> = [
+  [/马德里/gu, "Madrid"], [/布达佩斯/gu, "Budapest"], [/唐山/gu, "Tangshan"], [/北京/gu, "Beijing"], [/上海/gu, "Shanghai"],
+  [/广州/gu, "Guangzhou"], [/深圳/gu, "Shenzhen"], [/香港/gu, "Hong Kong"], [/澳门/gu, "Macau"], [/台北/gu, "Taipei"],
+  [/东京/gu, "Tokyo"], [/大阪/gu, "Osaka"], [/首尔/gu, "Seoul"], [/新加坡/gu, "Singapore"], [/曼谷/gu, "Bangkok"],
+  [/巴黎/gu, "Paris"], [/伦敦/gu, "London"], [/罗马/gu, "Rome"], [/米兰/gu, "Milan"], [/巴塞罗那/gu, "Barcelona"],
+  [/里斯本/gu, "Lisbon"], [/维也纳/gu, "Vienna"], [/布拉格/gu, "Prague"], [/柏林/gu, "Berlin"], [/慕尼黑/gu, "Munich"],
+  [/纽约/gu, "New York"], [/洛杉矶/gu, "Los Angeles"], [/旧金山/gu, "San Francisco"], [/悉尼/gu, "Sydney"], [/迪拜/gu, "Dubai"],
+];
 
 function plainText(value: string | undefined) {
   return (value ?? "")
@@ -55,6 +63,7 @@ function mapDestination(links: unknown) {
 }
 
 export function imageQueryForStop(stop: Record<string, unknown>, destination: string) {
+  if (typeof stop.imageQuery === "string" && stop.imageQuery.trim()) return stop.imageQuery.trim().slice(0, 180);
   const mapped = mapDestination(stop.links);
   if (mapped) return `${mapped} ${destination}`.trim();
   const title = typeof stop.title === "string" ? stop.title : "";
@@ -127,13 +136,33 @@ async function searchCommons(query: string): Promise<PlaceImage | null> {
   }
 }
 
+function latinFallback(query: string) {
+  const aliased = locationAliases.reduce((value, [pattern, replacement]) => value.replace(pattern, ` ${replacement} `), query);
+  const latin = aliased.split(/\s+/).filter((token) => /[A-Za-zÀ-ž]/.test(token)).join(" ").replace(/\s+/g, " ").trim();
+  if (foodWords.test(query)) return `${latin} cuisine restaurant food`.replace(/\b(local|food|restaurant|cuisine)\b(?:\s+\b\1\b)+/gi, "$1").trim();
+  return `${latin} city landmark`.replace(/\b(city|landmark)\b(?:\s+\b\1\b)+/gi, "$1").trim();
+}
+
+async function searchWithFallback(query: string) {
+  const fallback = latinFallback(query);
+  if (fallback && fallback.toLocaleLowerCase() !== query.toLocaleLowerCase()) {
+    const fallbackImage = await searchCommons(fallback);
+    if (fallbackImage) return fallbackImage;
+  }
+  const direct = await searchCommons(query);
+  if (direct) return direct;
+  const knownCity = locationAliases.find(([pattern]) => new RegExp(pattern.source, pattern.flags.replace("g", "")).test(query))?.[1];
+  const city = knownCity ?? fallback.split(/\s+/).filter((word) => !/^(landmark|city|local|food|restaurant|cuisine)$/i.test(word)).slice(-1).join(" ");
+  return searchCommons(foodWords.test(query) ? `${city} cuisine` : `${city} cityscape`);
+}
+
 export function findPlaceImage(query: string) {
   const normalized = query.replace(/\s+/g, " ").trim().slice(0, 220);
   if (!normalized) return Promise.resolve(null);
   const key = normalized.toLocaleLowerCase();
   const existing = cache.get(key);
   if (existing) return existing;
-  const pending = searchCommons(normalized);
+  const pending = searchWithFallback(normalized);
   cache.set(key, pending);
   if (cache.size > 500) cache.delete(cache.keys().next().value as string);
   return pending;
