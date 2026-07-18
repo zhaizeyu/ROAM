@@ -12,6 +12,6 @@ export async function GET(request: Request) {
   if (!query || query.length > 220) return NextResponse.json({ error: "图片查询内容无效。" }, { status: 400 });
   const image = await findPlaceImage(query);
   return NextResponse.json({ image }, {
-    headers: { "Cache-Control": "private, max-age=3600, stale-while-revalidate=86400" },
+    headers: { "Cache-Control": image ? "private, max-age=3600, stale-while-revalidate=86400" : "no-store" },
   });
 }

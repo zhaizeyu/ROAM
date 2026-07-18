@@ -163,7 +163,7 @@ function StopVisual({ stop, destination }: { stop: Stop; destination: string }) 
     if (stop.image) { setStatus("ready"); return; }
     const controller = new AbortController();
     setStatus("loading");
-    void fetch(`/api/place-image?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+    void fetch(`/api/place-image?q=${encodeURIComponent(query)}&v=2`, { signal: controller.signal, cache: "no-store" })
       .then(readJsonResponse)
       .then((data) => {
         const next = data.image as PlaceImage | null;
