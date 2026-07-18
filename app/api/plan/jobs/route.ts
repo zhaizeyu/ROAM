@@ -11,6 +11,7 @@ import {
   updateTrip,
 } from "../../../../lib/db";
 import { getAuthenticatedUser } from "../../../../lib/auth";
+import { enrichPlanImages } from "../../../../lib/place-images";
 import { POST as runPlan } from "../route";
 
 export const runtime = "nodejs";
@@ -53,6 +54,9 @@ async function runJob(jobId: string, requestUrl: string) {
 
     let tripId: string | null = null;
     if (response.ok && payload.plan && typeof payload.plan === "object") {
+      const enriched = await enrichPlanImages(payload.plan as Record<string, unknown>);
+      payload.plan = enriched.plan;
+      payload.imageSummary = { matched: enriched.matched, total: enriched.total };
       const clientId = typeof job.request_json.clientId === "string" && uuidPattern.test(job.request_json.clientId)
         ? job.request_json.clientId
         : null;
@@ -99,7 +103,7 @@ async function runJob(jobId: string, requestUrl: string) {
       jobId,
       tripId,
       userId: job.user_id,
-      metadata: { responseStatus: response.status, durationMs: Date.now() - startedAt, backend: payload.backend ?? null },
+      metadata: { responseStatus: response.status, durationMs: Date.now() - startedAt, backend: payload.backend ?? null, imageSummary: payload.imageSummary ?? null },
     });
   } catch (error) {
     const message = errorMessage(error);

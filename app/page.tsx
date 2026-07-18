@@ -3,6 +3,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type LinkItem = { label: string; url: string; kind?: "map" | "ticket" | "info" };
+type PlaceImage = {
+  url: string;
+  alt: string;
+  credit: string;
+  license: string;
+  licenseUrl?: string;
+  sourceUrl: string;
+  provider: "Wikimedia Commons";
+};
 type Stop = {
   time: string;
   title: string;
@@ -10,6 +19,7 @@ type Stop = {
   meta?: string;
   links?: LinkItem[];
   accent?: "red" | "gold" | "blue";
+  image?: PlaceImage;
 };
 type DayPlan = {
   id: string;
@@ -127,6 +137,52 @@ function RouteIcon() {
 }
 function TicketIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h13A1.5 1.5 0 0 1 20 7.5V10a2 2 0 0 0 0 4v2.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 16.5V14a2 2 0 0 0 0-4V7.5Z"/><path d="M12 8.5v7" /></svg>;
+}
+
+function visualQuery(stop: Stop, destination: string) {
+  for (const link of stop.links ?? []) {
+    try {
+      const url = new URL(link.url);
+      const mapped = url.hostname.includes("google.") && url.pathname.includes("/maps") && (url.searchParams.get("destination") ?? url.searchParams.get("query"));
+      if (mapped) return `${mapped} ${destination}`;
+    } catch { /* Ignore malformed links in older plans. */ }
+  }
+  const category = /餐|吃|美食|酒吧|咖啡|午餐|晚餐|早餐/i.test(`${stop.title} ${stop.text}`) ? "local food restaurant" : "landmark";
+  return `${stop.title} ${category} ${destination}`;
+}
+
+function StopVisual({ stop, destination }: { stop: Stop; destination: string }) {
+  const [image, setImage] = useState<PlaceImage | null>(stop.image ?? null);
+  const [status, setStatus] = useState<"loading" | "ready" | "empty">(stop.image ? "ready" : "loading");
+  const query = useMemo(() => visualQuery(stop, destination), [destination, stop]);
+
+  useEffect(() => {
+    setImage(stop.image ?? null);
+    if (stop.image) { setStatus("ready"); return; }
+    const controller = new AbortController();
+    setStatus("loading");
+    void fetch(`/api/place-image?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      .then(readJsonResponse)
+      .then((data) => {
+        const next = data.image as PlaceImage | null;
+        setImage(next);
+        setStatus(next ? "ready" : "empty");
+      })
+      .catch((error) => { if (error instanceof DOMException && error.name === "AbortError") return; setStatus("empty"); });
+    return () => controller.abort();
+  }, [query, stop.image]);
+
+  return <figure className={`stop-visual ${status}`}>
+    {image && status === "ready"
+      ? <img src={image.url} alt={image.alt || `${stop.title}参考图`} loading="lazy" decoding="async" referrerPolicy="no-referrer" onError={() => setStatus("empty")}/>
+      : <div className="stop-visual-fallback" aria-label={status === "loading" ? "正在加载参考图片" : "暂无可用参考图片"}>
+          <span>{status === "loading" ? "正在寻找参考图" : destination.slice(0, 1) || "R"}</span><strong>{stop.title}</strong>
+        </div>}
+    <figcaption>
+      <span>{status === "loading" ? "图片匹配中" : image && status === "ready" ? "地点参考图 · 以现场为准" : "暂无可授权图片 · 显示地点卡片"}</span>
+      {image && status === "ready" && <span className="image-credit"><a href={image.sourceUrl} target="_blank" rel="noreferrer">{image.provider}</a> · {image.credit} · {image.licenseUrl ? <a href={image.licenseUrl} target="_blank" rel="noreferrer">{image.license}</a> : image.license}</span>}
+    </figcaption>
+  </figure>;
 }
 
 const emptyInput: PlannerInput = {
@@ -581,6 +637,7 @@ export default function Home() {
                   <button className="check" onClick={() => toggle(key)} aria-label={done[key] ? "取消完成" : "标记完成"}>{done[key] ? "✓" : ""}</button>
                   <div className={`time ${stop.accent ?? ""}`}>{stop.time}</div>
                   <div className="stop-card">
+                    <StopVisual stop={stop} destination={trip.destination}/>
                     <div className="stop-top"><h3>{stop.title}</h3>{stop.meta && <span>{stop.meta}</span>}</div>
                     <p>{stop.text}</p>
                     {stop.links && <div className="actions">{stop.links.map((link) => <a key={link.url} href={link.url} target="_blank" rel="noreferrer" className={link.kind ?? "map"}>{link.kind === "ticket" ? <TicketIcon/> : <RouteIcon/>}{link.label}<span>↗</span></a>)}</div>}
